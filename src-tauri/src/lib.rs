@@ -725,16 +725,24 @@ async fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         .map(window_label)
         .find(|l| !taken.contains(l))
         .ok_or("Too many windows are already open")?;
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::default())
-        .title("mad")
-        .inner_size(1240.0, 820.0)
-        .min_inner_size(760.0, 480.0)
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(19.0, 27.0))
-        .disable_drag_drop_handler()
-        .build()
-        .map_err(|e| e.to_string())?;
+    // `fresh` marks this as a brand-new window rather than a restored one.
+    // Labels are recycled, and localStorage is shared, so without it a new
+    // window inherits whatever workspace a long-gone window of the same name
+    // was last showing — a folder the user did not choose.
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App("index.html?fresh=1".into()),
+    )
+    .title("mad")
+    .inner_size(1240.0, 820.0)
+    .min_inner_size(760.0, 480.0)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .traffic_light_position(tauri::LogicalPosition::new(19.0, 27.0))
+    .disable_drag_drop_handler()
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

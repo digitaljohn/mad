@@ -58,6 +58,12 @@ async function init() {
     : "main";
   const isMainWindow = winLabel === "main";
   const SESSION = sessionKey(winLabel);
+  // A window opened just now starts empty. Window labels are recycled and
+  // localStorage is shared, so a restored session under this label belongs to
+  // some earlier window, not to this one — restoring it would silently open a
+  // workspace the user never picked.
+  const isFreshWindow = new URLSearchParams(location.search).has("fresh");
+  if (isFreshWindow) clearSession(localStorage, SESSION);
   const saved = loadSession(localStorage, SESSION);
 
   const welcome = $("welcome");
