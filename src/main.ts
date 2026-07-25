@@ -8,7 +8,7 @@ import {
 } from "./backend";
 import { FileTree, fileIcon, GIT_LABEL } from "./tree";
 import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
-import { CommandPalette } from "./palette";
+import { CommandPalette, ICON_COMMAND, ICON_HEADING } from "./palette";
 import { toast, toastError } from "./toast";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -1065,20 +1065,28 @@ async function init() {
       const all = await backend.listAll(rootPath);
       return all.map((f) => ({
         title: baseOf(f.rel).replace(MD_RE, ""),
-        subtitle: f.rel,
-        glyph: IMG_RE.test(f.rel) ? "◧" : "≡",
+        // Show the containing folder, not the whole path — repeating the
+        // filename on the right is noise. Still matches on the full path.
+        subtitle: f.rel.includes("/") ? parentOf(f.rel) : undefined,
+        search: f.rel,
+        icon: fileIcon(f.rel),
         run: () => void openFile(f.path),
       }));
     },
     commands: () =>
       commands
         .filter((c) => (c.when ? c.when() : true))
-        .map((c) => ({ title: c.title, subtitle: c.hint, glyph: "›", run: c.run })),
+        .map((c) => ({
+          title: c.title,
+          subtitle: c.hint,
+          icon: ICON_COMMAND,
+          run: c.run,
+        })),
     outline: () =>
       editor.getOutline().map((h) => ({
         title: h.text || "(untitled heading)",
         subtitle: "H" + h.level,
-        glyph: "#",
+        icon: ICON_HEADING,
         run: () => {
           showSurface("editor");
           editor.scrollToHeading(h.id);
