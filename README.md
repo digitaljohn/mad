@@ -184,9 +184,15 @@ in-memory demo workspace — no Rust, no Tauri, no waiting. Most of the styling 
 done that way, and it's how the screenshots above were taken.
 
 ```bash
-npm test              # tsc + 23 Rust tests
+npm test              # 273 frontend unit tests (Vitest + jsdom)
+npm run test:rust     # 54 Rust tests, several against real git repositories
+npm run check         # everything CI runs: types, both suites, coverage, clippy
 npm run tauri build
 ```
+
+Every pull request runs the lot on CI, plus a release build. Coverage of the
+tested frontend modules is enforced at 100% statements/functions/lines — see
+[CONTRIBUTING.md](CONTRIBUTING.md) for what that does and doesn't include.
 
 ## How it's put together
 

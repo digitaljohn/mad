@@ -15,7 +15,10 @@ interface ToastOptions {
 let host: HTMLElement | null = null;
 
 function ensureHost(): HTMLElement {
-  if (!host) {
+  // `isConnected` matters: anything that replaces document.body's contents
+  // detaches the host while this module still holds a reference to it, and
+  // toasts would then be appended to an orphan node — visible to nobody.
+  if (!host || !host.isConnected) {
     host = document.createElement("div");
     host.id = "toasts";
     host.setAttribute("role", "status");

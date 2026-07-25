@@ -7,6 +7,25 @@ import {
   type SearchOptions,
 } from "./backend";
 import { FileTree, fileIcon, GIT_LABEL } from "./tree";
+import { TAB_DND } from "./dnd";
+import { diffStat as diffStat_, parseDiff } from "./diff";
+import {
+  IMG_RE,
+  MD_RE,
+  baseOf,
+  displayName,
+  escapeHtml,
+  isUnder,
+  parentOf,
+  remapPath,
+} from "./paths";
+import {
+  clampScale,
+  loadSession,
+  saveSession as persistSession,
+  usableTabs,
+  type Session,
+} from "./session";
 import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
 import { CommandPalette, ICON_COMMAND, ICON_HEADING } from "./palette";
 import { toast, toastError } from "./toast";
@@ -14,12 +33,8 @@ import { toast, toastError } from "./toast";
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 
-const SESSION_KEY = "mad:session";
-const IMG_RE = /\.(png|jpe?g|gif|svg|webp|bmp|avif)$/i;
-const MD_RE = /\.(md|markdown)$/i;
 /** Sentinel path for the single unsaved draft tab. */
 const DRAFT = "mad://draft";
-const TAB_DND = "application/x-mad-tab";
 
 interface Tab {
   path: string;
@@ -27,30 +42,10 @@ interface Tab {
   draft?: boolean;
 }
 
-/** Everything restored on next launch. */
-interface Session {
-  root: string | null;
-  tabs: string[];
-  active: string | null;
-  expanded: string[];
-  sidebarHidden: boolean;
-  scale: number;
-  sidebarWidth: string | null;
-}
-
-function loadSession(): Partial<Session> {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    return raw ? (JSON.parse(raw) as Partial<Session>) : {};
-  } catch {
-    return {};
-  }
-}
-
 async function init() {
   const backend = await createBackend();
   if (isTauri) document.body.classList.add("tauri");
-  const saved = loadSession();
+  const saved = loadSession(localStorage);
 
   const welcome = $("welcome");
   const editorEl = $("editor");
@@ -76,7 +71,7 @@ async function init() {
   let saveState: SaveState = "saved";
   /** git status per absolute path, mirrored onto tabs as well as the tree. */
   let gitMap = new Map<string, GitStatus>();
-  let docScale = clampScale(saved.scale ?? 1);
+  let docScale = clampScale(saved.scale);
 
   // ------------------------------------------------------------- session
 
@@ -93,11 +88,7 @@ async function init() {
         scale: docScale,
         sidebarWidth: sidebar.style.width || null,
       };
-      try {
-        localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-      } catch {
-        /* private mode / quota — the session is a nicety, not a requirement */
-      }
+      persistSession(localStorage, session);
     }, 250);
   };
 
@@ -134,8 +125,6 @@ async function init() {
     () => updateStatus(),
   );
 
-  const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/"));
-  const baseOf = (p: string) => p.split("/").pop() ?? p;
   const activeTab = () => tabs.find((t) => t.path === activePath) ?? null;
 
   const tabLabel = (tab: Tab) =>
@@ -143,7 +132,7 @@ async function init() {
       ? "Untitled"
       : tab.kind === "img"
         ? baseOf(tab.path)
-        : baseOf(tab.path).replace(MD_RE, "");
+        : displayName(tab.path);
 
   const hasUnsavedDraft = () => {
     if (!tabs.some((t) => t.draft)) return false;
@@ -494,7 +483,7 @@ async function init() {
 
   /** Close every tab under `path` (used after a move/delete invalidates it). */
   const closeTabsUnder = async (path: string) => {
-    const hit = (p: string) => p === path || p.startsWith(path + "/");
+    const hit = (p: string) => isUnder(p, path);
     if (!tabs.some((t) => hit(t.path))) return;
     const wasActive = activePath !== null && hit(activePath);
     tabs = tabs.filter((t) => !hit(t.path));
@@ -508,16 +497,11 @@ async function init() {
 
   /** After an on-disk rename/move of `oldPath` → `newPath`, fix open state. */
   const remapPaths = (oldPath: string, newPath: string) => {
-    const remap = (p: string) =>
-      p === oldPath
-        ? newPath
-        : p.startsWith(oldPath + "/")
-          ? newPath + p.slice(oldPath.length)
-          : p;
+    const remap = (p: string) => remapPath(p, oldPath, newPath);
     for (const t of tabs) if (!t.draft) t.path = remap(t.path);
     if (activePath) activePath = remap(activePath);
     const ep = editor.path;
-    if (ep && (ep === oldPath || ep.startsWith(oldPath + "/"))) {
+    if (ep && isUnder(ep, oldPath)) {
       editor.adoptPath(remap(ep));
     }
   };
@@ -613,7 +597,7 @@ async function init() {
     // If the open document is (under) the target, detach the editor FIRST so a
     // later autosave can't rewrite the trashed path and resurrect the file.
     const ep = editor.path;
-    if (ep && (ep === path || ep.startsWith(path + "/"))) editor.detach();
+    if (ep && isUnder(ep, path)) editor.detach();
     else await editor.flush(); // persist unrelated edits before touching the tree
     try {
       await backend.trashPath(path);
@@ -652,21 +636,6 @@ async function init() {
     diffPath = null;
   };
 
-  /** Classify a unified-diff line. Order matters: `+++`/`---` are headers, not
-      additions and deletions. */
-  const diffClass = (line: string) => {
-    if (line.startsWith("@@")) return "hunk";
-    if (
-      /^(\+\+\+|---|diff |index |new file|deleted file|similarity |rename |old mode|new mode|Binary )/.test(
-        line,
-      )
-    )
-      return "meta";
-    if (line.startsWith("+")) return "add";
-    if (line.startsWith("-")) return "del";
-    return "ctx";
-  };
-
   const showDiff = async (path: string) => {
     let text: string | null;
     try {
@@ -688,20 +657,16 @@ async function init() {
       empty.textContent = "No uncommitted changes in this file.";
       diffBody.appendChild(empty);
     } else {
-      let added = 0;
-      let removed = 0;
+      const parsed = parseDiff(text);
       const frag = document.createDocumentFragment();
-      for (const line of text.split("\n")) {
-        const cls = diffClass(line);
-        if (cls === "add") added++;
-        if (cls === "del") removed++;
+      for (const line of parsed.lines) {
         const el = document.createElement("div");
-        el.className = `diff-line ${cls}`;
-        el.textContent = line || " ";
+        el.className = `diff-line ${line.kind}`;
+        el.textContent = line.text || " ";
         frag.appendChild(el);
       }
       diffBody.appendChild(frag);
-      diffStat.textContent = `+${added} −${removed}`;
+      diffStat.textContent = diffStat_(parsed);
     }
     $("diff-discard").classList.toggle("hidden", !text);
     diffView.classList.remove("hidden");
@@ -924,9 +889,6 @@ async function init() {
     applyTheme(!document.documentElement.classList.contains("light"));
 
   // ----------------------------------------------------------------- zoom
-  function clampScale(n: number) {
-    return Math.min(2, Math.max(0.7, Math.round(n * 100) / 100));
-  }
   const applyScale = () => {
     document.documentElement.style.setProperty("--doc-scale", String(docScale));
   };
@@ -1018,9 +980,6 @@ async function init() {
     searchPanel.classList.contains("hidden") ? openSearch() : closeSearch(),
   );
   $("search-close").addEventListener("click", closeSearch);
-
-  const escapeHtml = (s: string) =>
-    s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
 
   const renderSearch = (hits: SearchHit[], query: string, truncated: boolean) => {
     searchResults.innerHTML = "";
@@ -1584,7 +1543,7 @@ async function init() {
   if (lastRoot) {
     try {
       await backend.listDir(lastRoot); // still accessible?
-      await setRoot(lastRoot, saved.expanded ?? []);
+      await setRoot(lastRoot, saved.expanded);
     } catch {
       rootPath = null;
     }
@@ -1592,7 +1551,7 @@ async function init() {
 
   const root = rootPath;
   if (root) {
-    const wanted = (saved.tabs ?? []).filter((p) => typeof p === "string");
+    const wanted = saved.tabs;
     if (wanted.length) {
       // Drop tabs whose file has since disappeared (one cheap index read).
       let known: Set<string>;
@@ -1601,8 +1560,7 @@ async function init() {
       } catch {
         known = new Set(wanted);
       }
-      tabs = wanted
-        .filter((p) => (p.startsWith(root + "/") ? known.has(p) : true))
+      tabs = usableTabs(wanted, root, known)
         .map((p) => ({
           path: p,
           kind: IMG_RE.test(p) ? ("img" as const) : ("md" as const),

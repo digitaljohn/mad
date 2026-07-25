@@ -21,7 +21,7 @@ struct Entry {
 
 /// A file's text plus a cheap change stamp (mtime + size). The frontend keeps
 /// the stamp so a later save can detect that the file changed underneath it.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct FileData {
     content: String,
     stamp: String,
@@ -68,10 +68,13 @@ fn is_junk_dir(name: &str) -> bool {
 /// part inside the workspace is considered — the workspace itself may perfectly
 /// well live in `~/.notes`, and that must not silence every event.
 fn in_skipped_dir(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root).unwrap_or(path).components().any(|c| {
-        let s = c.as_os_str().to_string_lossy();
-        is_junk_dir(&s) || (s.starts_with('.') && s.len() > 1)
-    })
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            is_junk_dir(&s) || (s.starts_with('.') && s.len() > 1)
+        })
 }
 
 // ---------------------------------------------------------------- recents
@@ -82,9 +85,11 @@ fn recents_file(app: &tauri::AppHandle) -> Option<PathBuf> {
     Some(dir.join("recents.json"))
 }
 
-fn load_recents(app: &tauri::AppHandle) -> Vec<String> {
-    recents_file(app)
-        .and_then(|p| fs::read_to_string(p).ok())
+/// Read the recents list from `file`, dropping anything that no longer exists.
+/// Split from the AppHandle lookup so it can be tested directly.
+fn read_recents(file: &Path) -> Vec<String> {
+    fs::read_to_string(file)
+        .ok()
         .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default()
         .into_iter()
@@ -93,9 +98,28 @@ fn load_recents(app: &tauri::AppHandle) -> Vec<String> {
         .collect()
 }
 
+fn write_recents(file: &Path, recents: &[String]) {
+    if let Ok(s) = serde_json::to_string(recents) {
+        let _ = fs::write(file, s);
+    }
+}
+
+/// Add `path` to the front, most-recent first, deduped and capped.
+fn push_recent_list(recents: &mut Vec<String>, path: String) {
+    recents.retain(|p| p != &path);
+    recents.insert(0, path);
+    recents.truncate(MAX_RECENTS);
+}
+
+fn load_recents(app: &tauri::AppHandle) -> Vec<String> {
+    recents_file(app)
+        .map(|p| read_recents(&p))
+        .unwrap_or_default()
+}
+
 fn save_recents(app: &tauri::AppHandle, recents: &[String]) {
-    if let (Some(p), Ok(s)) = (recents_file(app), serde_json::to_string(recents)) {
-        let _ = fs::write(p, s);
+    if let Some(p) = recents_file(app) {
+        write_recents(&p, recents);
     }
 }
 
@@ -188,10 +212,22 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .select_all()
         .separator()
         .item(&item("find", "Find…", Some("CmdOrCtrl+F"))?)
-        .item(&item("find_replace", "Find & Replace…", Some("CmdOrCtrl+Alt+F"))?)
-        .item(&item("search_files", "Find in Files…", Some("CmdOrCtrl+Shift+F"))?)
+        .item(&item(
+            "find_replace",
+            "Find & Replace…",
+            Some("CmdOrCtrl+Alt+F"),
+        )?)
+        .item(&item(
+            "search_files",
+            "Find in Files…",
+            Some("CmdOrCtrl+Shift+F"),
+        )?)
         .separator()
-        .item(&item("toggle_spellcheck", "Check Spelling While Typing", None)?)
+        .item(&item(
+            "toggle_spellcheck",
+            "Check Spelling While Typing",
+            None,
+        )?)
         .build()?;
 
     let view_menu = SubmenuBuilder::new(app, "View")
@@ -212,9 +248,17 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
             "Toggle Split Preview",
             Some("CmdOrCtrl+Shift+V"),
         )?)
-        .item(&item("toggle_sidebar", "Toggle Sidebar", Some("CmdOrCtrl+\\"))?)
+        .item(&item(
+            "toggle_sidebar",
+            "Toggle Sidebar",
+            Some("CmdOrCtrl+\\"),
+        )?)
         .separator()
-        .item(&item("show_changes", "Show Changes", Some("CmdOrCtrl+Shift+D"))?)
+        .item(&item(
+            "show_changes",
+            "Show Changes",
+            Some("CmdOrCtrl+Shift+D"),
+        )?)
         .separator()
         .item(&item("toggle_theme", "Toggle Light / Dark", None)?)
         .separator()
@@ -267,9 +311,7 @@ fn set_menu_state(app: tauri::AppHandle, can_save: bool, can_save_as: bool) {
 fn push_recent(app: tauri::AppHandle, state: tauri::State<Recents>, path: String) {
     let snapshot = {
         let mut recents = state.0.lock().unwrap();
-        recents.retain(|p| p != &path);
-        recents.insert(0, path);
-        recents.truncate(MAX_RECENTS);
+        push_recent_list(&mut recents, path);
         recents.clone()
     };
     save_recents(&app, &snapshot);
@@ -707,7 +749,11 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 #[tauri::command]
 async fn duplicate_path(path: String) -> Result<String, String> {
     let p = Path::new(&path);
-    let dir = p.parent().ok_or("Invalid path")?.to_string_lossy().into_owned();
+    let dir = p
+        .parent()
+        .ok_or("Invalid path")?
+        .to_string_lossy()
+        .into_owned();
     let name = p
         .file_name()
         .ok_or("Invalid path")?
@@ -1033,12 +1079,7 @@ fn parse_porcelain(
     (out, false)
 }
 
-const STATUS_ARGS: [&str; 4] = [
-    "status",
-    "--porcelain",
-    "-z",
-    "--untracked-files=all",
-];
+const STATUS_ARGS: [&str; 4] = ["status", "--porcelain", "-z", "--untracked-files=all"];
 
 /// A dirty submodule shows up in its parent's status as a single *directory*
 /// entry — the parent never says which file inside changed. So ask each dirty
@@ -1066,6 +1107,32 @@ fn expand_submodules(entries: &mut Vec<GitEntry>, depth: u8) {
 
 /// stdout regardless of exit status. `git diff` variants signal "differences
 /// found" with a non-zero code, which isn't a failure for our purposes.
+/// Drop directory marks that lead nowhere.
+///
+/// A submodule is reported by its parent as one directory entry, and it can be
+/// "modified" for reasons the sidebar can never show you — edits to source
+/// files, or simply sitting at a different commit. Marking the folder anyway
+/// produces the one thing worse than no mark: a dot you cannot chase. So after
+/// expansion, a directory keeps its mark only if some file inside it is one this
+/// app can actually open.
+///
+/// The trade is deliberate: mad stops telling you a submodule has non-document
+/// changes. It could not have shown you them, and a git tool does that job.
+fn drop_marks_that_lead_nowhere(entries: &mut Vec<GitEntry>) {
+    let files: Vec<String> = entries
+        .iter()
+        .filter(|e| !Path::new(&e.path).is_dir())
+        .map(|e| e.path.clone())
+        .collect();
+    entries.retain(|e| {
+        if !Path::new(&e.path).is_dir() {
+            return true;
+        }
+        let prefix = format!("{}/", e.path);
+        files.iter().any(|f| f.starts_with(&prefix))
+    });
+}
+
 fn git_output_lenient(dir: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .current_dir(dir)
@@ -1103,7 +1170,10 @@ async fn git_diff(path: String) -> Option<String> {
     }
     let name = p.file_name()?.to_string_lossy().into_owned();
     let lines: Vec<&str> = text.lines().collect();
-    let mut out = format!("--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n", lines.len());
+    let mut out = format!(
+        "--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n",
+        lines.len()
+    );
     for l in lines {
         out.push('+');
         out.push_str(l);
@@ -1178,10 +1248,18 @@ async fn git_status(root: String) -> Option<GitInfo> {
     // `-- .` limits the walk to the open workspace; porcelain paths stay
     // relative to the repository root regardless.
     let mut args = STATUS_ARGS.to_vec();
+    // Untracked files *inside* a submodule are nearly always build output that
+    // nobody gitignored, and they make git report the whole submodule as
+    // modified when nothing was actually changed — a mark you can't chase.
+    // Genuine tracked edits and commit differences are still reported, and a
+    // submodule reported for those reasons still gets expanded below, so a
+    // modified document inside one is still found.
+    args.push("--ignore-submodules=untracked");
     args.extend_from_slice(&["--", "."]);
     let raw = git_output(&root, &args)?;
     let (mut entries, truncated) = parse_porcelain(&root, &repo, &prefix, &raw);
     expand_submodules(&mut entries, 3);
+    drop_marks_that_lead_nowhere(&mut entries);
     Some(GitInfo {
         root: repo,
         entries,
@@ -1227,35 +1305,33 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let root = PathBuf::from(&path);
     std::thread::spawn(move || {
         const MAX_REPORTED: usize = 200;
-        let collect = |set: &mut BTreeSet<PathBuf>,
-                       git: &mut bool,
-                       res: notify::Result<notify::Event>| {
-            let Ok(ev) = res else { return };
-            for p in ev.paths {
-                // Git's own bookkeeping is invisible in the tree but changes
-                // every file's status, so it's a refresh signal, not content.
-                if is_git_signal(&root, &p) {
-                    *git = true;
-                    continue;
+        let collect =
+            |set: &mut BTreeSet<PathBuf>, git: &mut bool, res: notify::Result<notify::Event>| {
+                let Ok(ev) = res else { return };
+                for p in ev.paths {
+                    // Git's own bookkeeping is invisible in the tree but changes
+                    // every file's status, so it's a refresh signal, not content.
+                    if is_git_signal(&root, &p) {
+                        *git = true;
+                        continue;
+                    }
+                    // Our own atomic-save temp files and anything hidden/junk are
+                    // noise, not user-visible changes.
+                    if in_skipped_dir(&root, &p) {
+                        continue;
+                    }
+                    if p.file_name()
+                        .map(|n| {
+                            let n = n.to_string_lossy();
+                            n.starts_with('.') || n.ends_with(".mad-tmp")
+                        })
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    set.insert(p);
                 }
-                // Our own atomic-save temp files and anything hidden/junk are
-                // noise, not user-visible changes.
-                if in_skipped_dir(&root, &p) {
-                    continue;
-                }
-                if p
-                    .file_name()
-                    .map(|n| {
-                        let n = n.to_string_lossy();
-                        n.starts_with('.') || n.ends_with(".mad-tmp")
-                    })
-                    .unwrap_or(true)
-                {
-                    continue;
-                }
-                set.insert(p);
-            }
-        };
+            };
 
         loop {
             // Block until something happens (or the watcher is dropped).
@@ -1636,7 +1712,10 @@ mod tests {
 
         t.write("dir/deep/x.md", "deep");
         let dcopy = run(duplicate_path(t.s("dir"))).unwrap();
-        assert_eq!(fs::read_to_string(format!("{dcopy}/deep/x.md")).unwrap(), "deep");
+        assert_eq!(
+            fs::read_to_string(format!("{dcopy}/deep/x.md")).unwrap(),
+            "deep"
+        );
     }
 
     // ------------------------------------------------------------ listing
@@ -1736,6 +1815,212 @@ mod tests {
 
     // ------------------------------------------------------------ watching
 
+    // ------------------------------------------------------------- recents
+
+    #[test]
+    fn recents_round_trip_and_drop_folders_that_vanished() {
+        let t = TempDir::new();
+        let file = t.path().join("recents.json");
+        let gone = t.s("deleted-folder");
+        fs::create_dir(t.path().join("kept")).unwrap();
+        let kept = t.s("kept");
+
+        write_recents(&file, &[kept.clone(), gone.clone()]);
+        // The vanished folder must not come back as a dead menu entry.
+        assert_eq!(read_recents(&file), vec![kept]);
+    }
+
+    #[test]
+    fn reading_recents_tolerates_a_missing_or_corrupt_file() {
+        let t = TempDir::new();
+        assert_eq!(
+            read_recents(&t.path().join("absent.json")),
+            Vec::<String>::new()
+        );
+        let bad = t.path().join("bad.json");
+        fs::write(&bad, "{not json").unwrap();
+        assert_eq!(read_recents(&bad), Vec::<String>::new());
+        // Right JSON, wrong shape.
+        fs::write(&bad, "{\"a\":1}").unwrap();
+        assert_eq!(read_recents(&bad), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pushing_a_recent_moves_it_to_the_front_without_duplicating() {
+        let mut list = vec!["/b".to_string(), "/c".to_string()];
+        push_recent_list(&mut list, "/a".into());
+        assert_eq!(list, ["/a", "/b", "/c"]);
+        // Re-opening /c promotes it rather than adding a second entry.
+        push_recent_list(&mut list, "/c".into());
+        assert_eq!(list, ["/c", "/a", "/b"]);
+    }
+
+    #[test]
+    fn the_recents_list_is_capped() {
+        let mut list = Vec::new();
+        for i in 0..MAX_RECENTS + 5 {
+            push_recent_list(&mut list, format!("/f{i}"));
+        }
+        assert_eq!(list.len(), MAX_RECENTS);
+        assert_eq!(list[0], format!("/f{}", MAX_RECENTS + 4));
+    }
+
+    // ------------------------------------------------------- small helpers
+
+    #[test]
+    fn status_codes_collapse_to_the_most_alarming_meaning() {
+        // Conflicts outrank everything, then deletion, then addition.
+        for (x, y) in [('U', 'U'), ('A', 'A'), ('D', 'D'), ('U', 'D'), ('A', 'U')] {
+            assert_eq!(classify_status(x, y), "conflict", "{x}{y}");
+        }
+        assert_eq!(classify_status('?', '?'), "untracked");
+        assert_eq!(classify_status('A', ' '), "added");
+        assert_eq!(classify_status('A', 'M'), "added");
+        assert_eq!(classify_status('D', ' '), "deleted");
+        assert_eq!(classify_status(' ', 'D'), "deleted");
+        assert_eq!(classify_status('M', 'D'), "deleted");
+        assert_eq!(classify_status('R', ' '), "renamed");
+        assert_eq!(classify_status('C', ' '), "renamed");
+        assert_eq!(classify_status(' ', 'M'), "modified");
+        assert_eq!(classify_status('M', ' '), "modified");
+        assert_eq!(classify_status('T', ' '), "modified");
+    }
+
+    #[test]
+    fn only_files_the_sidebar_shows_count_as_visible() {
+        assert!(shows_in_tree(Path::new("/w/a.md")));
+        assert!(shows_in_tree(Path::new("/w/a.MARKDOWN")));
+        assert!(shows_in_tree(Path::new("/w/p.PNG")));
+        assert!(!shows_in_tree(Path::new("/w/main.c")));
+        assert!(!shows_in_tree(Path::new("/w/Makefile"))); // no extension, not a dir
+    }
+
+    #[test]
+    fn a_directory_counts_as_visible_so_submodules_can_be_marked() {
+        let t = TempDir::new();
+        fs::create_dir(t.path().join("vendor")).unwrap();
+        assert!(shows_in_tree(&t.path().join("vendor")));
+    }
+
+    #[test]
+    fn junk_directories_are_named_explicitly() {
+        for d in ["node_modules", "target", "dist", "build", ".git"] {
+            assert!(is_junk_dir(d), "{d}");
+        }
+        assert!(!is_junk_dir("docs"));
+        assert!(!is_junk_dir("distribution"));
+    }
+
+    #[test]
+    fn markdown_detection_is_case_insensitive() {
+        assert!(is_markdown(Path::new("a.md")));
+        assert!(is_markdown(Path::new("a.MD")));
+        assert!(is_markdown(Path::new("a.Markdown")));
+        assert!(!is_markdown(Path::new("a.mdx")));
+        assert!(!is_markdown(Path::new("md")));
+    }
+
+    #[test]
+    fn a_stamp_changes_with_content_and_is_empty_when_absent() {
+        let t = TempDir::new();
+        let p = t.path().join("f.md");
+        assert_eq!(stamp_of(&p), "", "a missing file has a stable empty stamp");
+        fs::write(&p, "a").unwrap();
+        let first = stamp_of(&p);
+        assert!(!first.is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&p, "much longer content").unwrap();
+        assert_ne!(stamp_of(&p), first);
+    }
+
+    #[test]
+    fn splitting_a_name_keeps_dotfiles_whole() {
+        assert_eq!(split_name("a.md"), ("a".into(), ".md".into()));
+        assert_eq!(split_name("a.b.md"), ("a.b".into(), ".md".into()));
+        assert_eq!(split_name("README"), ("README".into(), "".into()));
+        // A leading dot is the whole name, not an extension.
+        assert_eq!(split_name(".gitignore"), (".gitignore".into(), "".into()));
+    }
+
+    #[test]
+    fn unique_path_walks_past_every_taken_name() {
+        let t = TempDir::new();
+        let dir = t.path().to_string_lossy().into_owned();
+        t.write("n.md", "");
+        t.write("n 2.md", "");
+        assert!(unique_path(&dir, "n.md").ends_with("n 3.md"));
+    }
+
+    #[test]
+    fn reading_an_oversized_image_is_refused_rather_than_buffered() {
+        let t = TempDir::new();
+        let p = t.write("huge.png", "");
+        // 64 MiB + 1 of zeros, written sparsely.
+        let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.set_len(64 * 1024 * 1024 + 1).unwrap();
+        drop(f);
+        assert!(run(read_image(p)).is_err());
+    }
+
+    #[test]
+    fn reading_a_missing_image_is_an_error() {
+        let t = TempDir::new();
+        assert!(run(read_image(t.s("nope.png"))).is_err());
+    }
+
+    #[test]
+    fn an_image_round_trips_through_base64() {
+        let t = TempDir::new();
+        let dir = t.path().to_string_lossy().into_owned();
+        let name = run(save_image(dir, "p.png".into(), "aGVsbG8=".into())).unwrap();
+        assert_eq!(name, "p.png");
+        assert_eq!(fs::read(t.path().join("p.png")).unwrap(), b"hello");
+        let b64 = run(read_image(t.s("p.png"))).unwrap();
+        assert_eq!(b64, "aGVsbG8=");
+    }
+
+    #[test]
+    fn invalid_base64_is_rejected_before_touching_the_disk() {
+        let t = TempDir::new();
+        let dir = t.path().to_string_lossy().into_owned();
+        assert!(run(save_image(dir, "p.png".into(), "not base64!".into())).is_err());
+        assert!(!t.path().join("p.png").exists());
+    }
+
+    #[test]
+    fn reading_a_non_utf8_file_explains_itself() {
+        let t = TempDir::new();
+        let p = t.path().join("binary.md");
+        fs::write(&p, [0xff, 0xfe, 0x00]).unwrap();
+        let err = run(read_file(p.to_string_lossy().into_owned())).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn writing_into_a_missing_directory_fails_without_leaving_a_temp_file() {
+        let t = TempDir::new();
+        let target = t.s("no-such-dir/note.md");
+        assert!(run(write_file(target, "x".into(), None)).is_err());
+        assert_eq!(names(t.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn file_stamp_matches_the_one_returned_with_the_content() {
+        let t = TempDir::new();
+        let p = t.write("f.md", "body\n");
+        let data = run(read_file(p.clone())).unwrap();
+        assert_eq!(run(file_stamp(p)), data.stamp);
+    }
+
+    #[test]
+    fn an_empty_search_query_returns_nothing_without_walking() {
+        let t = TempDir::new();
+        t.write("a.md", "needle\n");
+        let res = run(search_files(t.s(""), "   ".into(), false, false, false)).unwrap();
+        assert!(res.hits.is_empty());
+        assert!(!res.truncated);
+    }
+
     #[test]
     fn skipped_dirs_cover_hidden_and_build_output() {
         let root = Path::new("/work");
@@ -1796,8 +2081,7 @@ mod tests {
         // from the path the user opened (the classic macOS /var → /private/var
         // symlink). Entries must come back under the opened path.
         let raw = " M docs/a.md\0?? docs/sub/b.md\0 M elsewhere/c.md\0";
-        let (entries, _) =
-            parse_porcelain("/var/work/docs", "/private/var/work", "docs/", raw);
+        let (entries, _) = parse_porcelain("/var/work/docs", "/private/var/work", "docs/", raw);
         let got: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(
             got,
@@ -1874,7 +2158,10 @@ mod tests {
         init(&outer);
         fs::write(outer.join("docs/deep/nested.md"), "spec\n").unwrap();
         fs::write(outer.join("firmware/main.c"), "int main(){}\n").unwrap();
-        run(&outer, &["submodule", "add", "--quiet", "../inner", "vendor"]);
+        run(
+            &outer,
+            &["submodule", "add", "--quiet", "../inner", "vendor"],
+        );
         run(&outer, &["add", "-A"]);
         run(&outer, &["commit", "--quiet", "-m", "init"]);
 
@@ -1905,6 +2192,74 @@ mod tests {
     /// `git_status` on a path, driven through the async command wrapper.
     fn run_cmd(dir: &Path) -> GitInfo {
         run(git_status(dir.to_string_lossy().into_owned())).expect("should be a repo")
+    }
+
+    #[test]
+    fn untracked_junk_inside_a_submodule_is_not_a_change() {
+        // The common false positive: build output nobody gitignored makes git
+        // call the whole submodule "modified" though nothing was edited and the
+        // recorded commit still matches. Reporting it puts a mark on a folder
+        // with nothing to find inside.
+        let t = TempDir::new();
+        let g = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(dir)
+                    .args(["-c", "protocol.file.allow=always"])
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
+                "git {args:?} failed"
+            );
+        };
+        let init = |dir: &Path| {
+            g(dir, &["init", "--quiet", "-b", "main"]);
+            g(dir, &["config", "user.email", "t@example.com"]);
+            g(dir, &["config", "user.name", "t"]);
+        };
+
+        let inner = t.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        init(&inner);
+        fs::write(inner.join("kept.md"), "one\n").unwrap();
+        g(&inner, &["add", "-A"]);
+        g(&inner, &["commit", "--quiet", "-m", "init"]);
+
+        let outer = t.path().join("outer");
+        fs::create_dir_all(&outer).unwrap();
+        init(&outer);
+        fs::write(outer.join("top.md"), "top\n").unwrap();
+        g(
+            &outer,
+            &["submodule", "add", "--quiet", "../inner", "vendor"],
+        );
+        g(&outer, &["add", "-A"]);
+        g(&outer, &["commit", "--quiet", "-m", "init"]);
+
+        // Only untracked build output inside the submodule.
+        fs::write(outer.join("vendor/build.o"), "junk\n").unwrap();
+        fs::write(outer.join("vendor/scratch.md"), "untracked doc\n").unwrap();
+
+        let info = run_cmd(&outer);
+        assert!(
+            info.entries.is_empty(),
+            "a submodule dirtied only by untracked content is not a change: {:?}",
+            info.entries
+        );
+
+        // But a genuinely edited tracked document inside it still surfaces,
+        // both as the submodule mark and as the file itself.
+        fs::write(outer.join("vendor/kept.md"), "one\ntwo\n").unwrap();
+        let info = run_cmd(&outer);
+        let paths: Vec<&str> = info.entries.iter().map(|e| e.path.as_str()).collect();
+        let vendor = outer.join("vendor").to_string_lossy().into_owned();
+        let kept = outer.join("vendor/kept.md").to_string_lossy().into_owned();
+        assert!(paths.contains(&vendor.as_str()), "{paths:?}");
+        assert!(paths.contains(&kept.as_str()), "{paths:?}");
     }
 
     /// A repo with one committed file, returned as (repo dir, file path).
@@ -2015,7 +2370,79 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(!git_in_head(&d, &fresh), "staged-but-uncommitted is not in HEAD");
+        assert!(
+            !git_in_head(&d, &fresh),
+            "staged-but-uncommitted is not in HEAD"
+        );
+    }
+
+    #[test]
+    fn a_submodule_with_only_source_changes_is_left_unmarked() {
+        // linux-kernel-shaped case: real tracked edits inside a submodule, none
+        // of them files this app can open. A dot there could not be chased.
+        let t = TempDir::new();
+        let g = |dir: &Path, args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(dir)
+                    .args(["-c", "protocol.file.allow=always"])
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
+                "git {args:?} failed"
+            );
+        };
+        let init = |dir: &Path| {
+            g(dir, &["init", "--quiet", "-b", "main"]);
+            g(dir, &["config", "user.email", "t@example.com"]);
+            g(dir, &["config", "user.name", "t"]);
+        };
+
+        let inner = t.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        init(&inner);
+        fs::write(inner.join("driver.c"), "int x;\n").unwrap();
+        fs::write(inner.join("guide.md"), "guide\n").unwrap();
+        g(&inner, &["add", "-A"]);
+        g(&inner, &["commit", "--quiet", "-m", "init"]);
+
+        let outer = t.path().join("outer");
+        fs::create_dir_all(&outer).unwrap();
+        init(&outer);
+        fs::write(outer.join("top.md"), "top\n").unwrap();
+        g(
+            &outer,
+            &["submodule", "add", "--quiet", "../inner", "vendor"],
+        );
+        g(&outer, &["add", "-A"]);
+        g(&outer, &["commit", "--quiet", "-m", "init"]);
+
+        // Only source changed inside the submodule.
+        fs::write(outer.join("vendor/driver.c"), "int x; int y;\n").unwrap();
+        let info = run_cmd(&outer);
+        assert!(
+            info.entries.is_empty(),
+            "nothing openable changed, so nothing should be marked: {:?}",
+            info.entries
+        );
+
+        // Add a document change and the submodule earns its mark back.
+        fs::write(outer.join("vendor/guide.md"), "guide\nmore\n").unwrap();
+        let paths: Vec<String> = run_cmd(&outer)
+            .entries
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("/vendor")), "{paths:?}");
+        assert!(
+            paths.iter().any(|p| p.ends_with("/vendor/guide.md")),
+            "{paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.ends_with(".c")), "{paths:?}");
     }
 
     #[test]
@@ -2026,7 +2453,10 @@ mod tests {
         assert!(is_git_signal(root, Path::new("/work/.git/refs/heads/main")));
         // Lock and object churn would fire constantly for no visible change.
         assert!(!is_git_signal(root, Path::new("/work/.git/index.lock")));
-        assert!(!is_git_signal(root, Path::new("/work/.git/objects/ab/cdef")));
+        assert!(!is_git_signal(
+            root,
+            Path::new("/work/.git/objects/ab/cdef")
+        ));
         assert!(!is_git_signal(root, Path::new("/work/notes/.git-notes.md")));
         assert!(!is_git_signal(root, Path::new("/work/note.md")));
     }
@@ -2083,10 +2513,16 @@ mod tests {
         assert_eq!(by_path.get(abs("tracked.md").as_str()), Some(&"modified"));
         assert_eq!(by_path.get(abs("fresh.md").as_str()), Some(&"untracked"));
         assert_eq!(by_path.get(abs("staged.md").as_str()), Some(&"added"));
-        assert_eq!(by_path.get(abs("nested/deep.md").as_str()), Some(&"deleted"));
+        assert_eq!(
+            by_path.get(abs("nested/deep.md").as_str()),
+            Some(&"deleted")
+        );
         assert!(!info.truncated);
         // Committed-and-untouched files must not be reported at all.
-        assert!(!info.entries.iter().any(|e| e.path.ends_with("nested/other.md")));
+        assert!(!info
+            .entries
+            .iter()
+            .any(|e| e.path.ends_with("nested/other.md")));
 
         // The repo root is discovered even when the workspace is a subfolder.
         let sub = run(git_status(t.s("nested"))).expect("subdir is still in the repo");
@@ -2102,7 +2538,10 @@ mod tests {
         // absolute path instead of the part below the workspace root.
         let root = Path::new("/Users/x/.notes");
         assert!(!in_skipped_dir(root, Path::new("/Users/x/.notes/today.md")));
-        assert!(!in_skipped_dir(root, Path::new("/Users/x/.notes/sub/today.md")));
+        assert!(!in_skipped_dir(
+            root,
+            Path::new("/Users/x/.notes/sub/today.md")
+        ));
         assert!(in_skipped_dir(root, Path::new("/Users/x/.notes/.git/HEAD")));
     }
 }
