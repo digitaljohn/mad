@@ -1,6 +1,6 @@
 [package]
 name = "mad"
-version = "0.2.0"
+version = "0.2.1"
 description = "mad — a tiny markdown editor"
 authors = ["john"]
 edition = "2021"

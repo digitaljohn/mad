@@ -3,6 +3,27 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
+## 0.2.1 — 2026-07-25
+
+Both of 0.2.0's user-facing breakages, found within minutes of release.
+
+### Fixed
+
+- **Extra windows didn't work.** A window opened with File ▸ New Window came
+  up with no permissions at all: it couldn't be dragged, couldn't be closed,
+  and never received a single menu command. The app's capability was still
+  scoped to the first window alone, and `core:default` grants only read-only
+  window queries — so dragging and closing now have to be, and are, named
+  explicitly. A failed close also says so now instead of presenting as a dead
+  button.
+- **Links between notes opened a browser window.** `[spec](./spec.md)` sent
+  you to your browser rather than to the document. The link handler read the
+  DOM-resolved URL, which resolves a relative path against the webview's own
+  origin — so a link to the note next door was indistinguishable from a link
+  to the open internet. Links now resolve from the href as written: another
+  note or image opens in a tab, anything else on disk goes to the OS, real
+  URLs still open in your browser, and `#heading` scrolls.
+
 ## 0.2.0 — 2026-07-25
 
 ### Added
