@@ -26,6 +26,13 @@ CI runs all of it on every pull request, on Linux for the frontend and macOS for
 Rust, plus a release build of the app because unit tests never link the binary or
 run Tauri's build script.
 
+The workflow deliberately uses **only first-party `actions/*` steps**. A
+repository can be configured to allow nothing else, and a workflow that reaches
+for a third-party action then fails at startup with no log to explain itself —
+which is exactly what happened the first time this landed. Rust is set up with
+plain `rustup` calls instead, and `cargo-llvm-cov` is fetched as a prebuilt
+binary. Please keep it that way.
+
 ## Where the tests live
 
 Frontend tests sit beside the module they cover — `src/paths.ts` →
