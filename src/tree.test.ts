@@ -256,6 +256,35 @@ describe("git decorations", () => {
     expect(row("/w/pic.png").className).not.toContain("git");
   });
 
+  it("keeps decorations across a full re-render, not just the patch path", async () => {
+    // setGit patches badges in place; a later re-render (a refresh, a
+    // selection change) rebuilds rows from scratch and must reproduce the
+    // same marks — files and folder dots alike.
+    await tree.reveal("/w/journal/deep/note.md");
+    tree.setGit(info([{ path: "/w/journal/deep/note.md", status: "modified" }]));
+    tree.select("/w/README.md"); // forces a rebuild
+    const dir = row("/w/journal").querySelector(".git-badge")!;
+    expect(dir.textContent).toBe("");
+    expect(dir.getAttribute("title")).toContain("modified");
+    expect(
+      row("/w/journal/deep/note.md").querySelector(".git-badge")!.textContent,
+    ).toBe("M");
+  });
+
+  it("survives a git update while a row is being renamed", () => {
+    tree.startRename("/w/README.md");
+    tree.setGit(info([{ path: "/w/README.md", status: "modified" }]));
+    const row = container.querySelector<HTMLElement>(
+      `[data-path="${CSS.escape("/w/README.md")}"]`,
+    )!;
+    // The input survives…
+    expect(row.querySelector(".rename-input")).toBeTruthy();
+    // …and no stray badge is appended beside it. Without the skip, patching
+    // decorates the rename row with a letter that has nowhere to sit, which
+    // is what "corrupt it" actually looks like.
+    expect(row.querySelector(".git-badge")).toBe(null);
+  });
+
   it("clears every mark when the folder stops being a repository", () => {
     tree.setGit(info([{ path: "/w/README.md", status: "modified" }]));
     tree.setGit(null);

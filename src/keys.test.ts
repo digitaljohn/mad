@@ -40,8 +40,8 @@ describe("resolveKey", () => {
       "KeyF",
       "KeyW",
       "KeyD",
+      "KeyO",
       "Backslash",
-      "Equal",
       "Minus",
       "Digit0",
       "KeyS",
@@ -51,6 +51,15 @@ describe("resolveKey", () => {
     ])("does not double-handle %s — the menu event already runs it", (code) => {
       expect(resolveKey(stroke(code), native)).toBeNull();
       expect(resolveKey(stroke(code, { shift: true }), native)).toBeNull();
+    });
+
+    it("does not double-handle plain ⌘= but claims the ⌘⇧= variant", () => {
+      // The menu registers only "CmdOrCtrl+=", so ⌘⇧= would otherwise be dead.
+      expect(resolveKey(stroke("Equal"), native)).toBeNull();
+      expect(resolveKey(stroke("Equal", { shift: true }), native)).toEqual({
+        kind: "zoom",
+        delta: 1,
+      });
     });
 
     it("still resolves the bindings that have no menu item", () => {
@@ -78,6 +87,8 @@ describe("resolveKey", () => {
       ["KeyF", {}, { kind: "find" }],
       ["KeyF", { alt: true }, { kind: "find-replace" }],
       ["KeyF", { shift: true }, { kind: "search-files" }],
+      ["KeyO", { shift: true }, { kind: "goto-heading" }],
+      ["Equal", { shift: true }, { kind: "zoom", delta: 1 }],
       ["KeyW", {}, { kind: "close-tab" }],
       ["KeyD", { shift: true }, { kind: "show-diff" }],
       ["Backslash", {}, { kind: "toggle-sidebar" }],

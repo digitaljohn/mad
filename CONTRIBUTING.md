@@ -20,11 +20,12 @@ or individually:
 | `npm run test:watch` | the same, watching |
 | `npm run test:coverage` | with coverage, and the thresholds enforced |
 | `npm run test:rust` | Rust unit tests |
-| `npm run lint` | `tsc --noEmit` plus `clippy -D warnings` |
+| `npm run lint` | `tsc --noEmit`, `cargo fmt --check` and `clippy -D warnings` |
 
-CI runs all of it on every pull request, on Linux for the frontend and macOS for
-Rust, plus a release build of the app because unit tests never link the binary or
-run Tauri's build script.
+CI runs all of it on every pull request — all three jobs on macOS runners (this
+repository never gets a Linux runner allocated; the comment in `ci.yml` tells
+that story) — plus a release build of the app, because unit tests never link the
+binary or run Tauri's build script.
 
 The workflow deliberately uses **only first-party `actions/*` steps**. A
 repository can be configured to allow nothing else, and a workflow that reaches
@@ -42,8 +43,8 @@ Frontend tests sit beside the module they cover — `src/paths.ts` →
 ## What coverage means here
 
 The frontend modules under test are at **100% statements, functions and lines**,
-and 99.75% branches. Thresholds in `vitest.config.ts` fail the build on a
-regression, so this doesn't quietly rot.
+with branches a fraction under (the enforced floor is 99%). Thresholds in
+`vitest.config.ts` fail the build on a regression, so this doesn't quietly rot.
 
 The number is only worth reading if you know what it covers, so:
 
