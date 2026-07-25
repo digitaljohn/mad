@@ -3,6 +3,30 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
+## 0.2.2 — 2026-07-25
+
+Nothing changes in the app. This is a build-toolchain release, published
+because the thing users download is now produced by a different bundler and
+that is worth proving in the open rather than assuming.
+
+### Changed
+
+- Built with TypeScript 7, Vite 8 and Vitest 4. The app bundle is now built
+  by Rolldown rather than Rollup — same code, different machinery.
+- TypeScript 7 requires a type declaration for side-effect imports, so
+  `vite/client` is now in `tsconfig`; that is what gives
+  `import "./styles.css"` a type.
+- The coverage floor is 95% across the board. Vitest 4 maps coverage through
+  the AST rather than by line, so it counts defensive branches the previous
+  provider credited silently — the same code measures slightly lower without
+  anything having got worse.
+
+### Fixed
+
+- "Copy Path" claimed success when both the clipboard API *and* its fallback
+  were blocked. It now says it failed, which is what the newer coverage
+  measurement turned up.
+
 ## 0.2.1 — 2026-07-25
 
 Both of 0.2.0's user-facing breakages, found within minutes of release.
