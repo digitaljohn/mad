@@ -1720,12 +1720,20 @@ async function init() {
     // one is gone.)
     const thisWindow = getCurrentWindow();
     void thisWindow.onCloseRequested(async (e) => {
+      // Holding the close means WE are now responsible for completing it. If
+      // anything below throws, the window becomes unclosable — so say so
+      // rather than leaving the user clicking a dead button.
       e.preventDefault();
-      if (!(await settle("Close"))) return;
-      // Extra windows are ephemeral — leaving their session behind would
-      // accumulate dead keys in localStorage forever.
-      if (!isMainWindow) clearSession(localStorage, SESSION);
-      await thisWindow.destroy();
+      try {
+        if (!(await settle("Close"))) return;
+        // Extra windows are ephemeral — leaving their session behind would
+        // accumulate dead keys in localStorage forever.
+        if (!isMainWindow) clearSession(localStorage, SESSION);
+        await thisWindow.destroy();
+      } catch (err) {
+        settling = false; // let them try again
+        toastError("Couldn’t close this window", err);
+      }
     });
 
     // Native menu items.

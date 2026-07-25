@@ -1,13 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
+  "description": "Every mad window. Applies to the label new_window() generates (mad-N) as well as the first window — a capability scoped to \"main\" alone leaves extra windows unable to listen for events, be dragged, or be closed. core:default covers only read-only window queries, so dragging and destroying are named explicitly.",
   "windows": [
-    "main"
+    "main",
+    "mad-*"
   ],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-destroy",
     "opener:default",
     "updater:default",
     "process:allow-restart"
