@@ -40,7 +40,7 @@ jobs:
         # Otherwise a v0.2.0 release can ship a binary that calls itself 0.1.0.
         run: node scripts/set-version.mjs --check "${{ steps.version.outputs.version }}"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
