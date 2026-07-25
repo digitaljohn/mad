@@ -1,11 +1,11 @@
 use base64::Engine;
 use notify::Watcher as _;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
@@ -51,12 +51,43 @@ fn gate_on(gate: Gate, doc: bool, tab: bool, folder: bool) -> bool {
     }
 }
 
-/// Handles to the state-gated menu items so the frontend can enable/disable
-/// them as the app state changes. `enabled` remembers the latest state across
-/// menu rebuilds (e.g. when Open Recent changes).
+/// What the gated menu items should look like for one window.
+type GateState = (bool, bool, bool);
+
+/// Handles to the state-gated menu items, plus each window's desired state.
+///
+/// macOS has exactly one menu bar for the whole app, but "Save" has to mean
+/// the *focused* window's document — so the state is stored per window label
+/// and re-applied whenever focus moves.
+#[derive(Default)]
 struct MenuState {
     gated: Mutex<Vec<(MenuItem<Wry>, Gate)>>,
-    enabled: Mutex<(bool, bool, bool)>,
+    per_window: Mutex<HashMap<String, GateState>>,
+    /// The window whose state the menu bar is currently showing.
+    focused: Mutex<Option<String>>,
+}
+
+impl MenuState {
+    fn state_for(&self, label: Option<&str>) -> GateState {
+        label
+            .and_then(|l| {
+                self.per_window
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(l)
+                    .copied()
+            })
+            // A window we've heard nothing from yet has nothing open.
+            .unwrap_or((false, false, false))
+    }
+
+    /// Paint the menu bar for `label`. Must run on the main thread.
+    fn apply(&self, label: Option<&str>) {
+        let (doc, tab, folder) = self.state_for(label);
+        for (item, gate) in self.gated.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let _ = item.set_enabled(gate_on(*gate, doc, tab, folder));
+        }
+    }
 }
 
 /// Label each recent by folder name, disambiguating duplicates with their
@@ -91,9 +122,12 @@ fn recent_labels(paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Live filesystem watcher for the open workspace. Dropping it stops watching
-/// (and ends its debounce thread, whose channel sender lives inside it).
-struct FsWatcher(Mutex<Option<notify::RecommendedWatcher>>);
+/// Live filesystem watchers, one per window — each window has its own open
+/// workspace. Dropping a watcher stops watching (and ends its debounce thread,
+/// whose channel sender lives inside it), so replacing or removing an entry is
+/// all the teardown there is.
+#[derive(Default)]
+struct FsWatcher(Mutex<HashMap<String, notify::RecommendedWatcher>>);
 
 const MAX_RECENTS: usize = 10;
 
@@ -353,11 +387,11 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let (doc, tab, folder) = *app
-        .state::<MenuState>()
-        .enabled
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    // Build in the focused window's state, so a rebuild (Open Recent changing,
+    // say) doesn't momentarily paint some other window's menu.
+    let ms = app.state::<MenuState>();
+    let focused = ms.focused.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (doc, tab, folder) = ms.state_for(focused.as_deref());
 
     let item = |id: &str, label: &str, accel: Option<&str>| -> tauri::Result<MenuItem<Wry>> {
         let mut b = MenuItemBuilder::with_id(id, label);
@@ -418,12 +452,12 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let save = gitem("save", "Save", Some("CmdOrCtrl+S"), Gate::Doc)?;
     let save_as = gitem("save_as", "Save As…", Some("CmdOrCtrl+Shift+S"), Gate::Doc)?;
     let new_file = item("new_file", "New File", Some("CmdOrCtrl+N"))?;
-    let new_folder = gitem(
-        "new_folder",
-        "New Folder",
-        Some("CmdOrCtrl+Shift+N"),
-        Gate::Folder,
-    )?;
+    // ⇧⌘N is New Window here, following every other macOS app that already
+    // spends ⌘N on "new document". New Folder gives it up: it acts on a
+    // specific folder in the tree, where its context menu already offers it
+    // (this is exactly what VS Code does with the same collision).
+    let new_window = item("new_window", "New Window", Some("CmdOrCtrl+Shift+N"))?;
+    let new_folder = gitem("new_folder", "New Folder", None, Gate::Folder)?;
     let open_folder = item("open_folder", "Open Folder…", Some("CmdOrCtrl+O"))?;
     let close_tab = gitem("close_tab", "Close Tab", Some("CmdOrCtrl+W"), Gate::Tab)?;
     let export_html = gitem("export_html", "Export as HTML…", None, Gate::Doc)?;
@@ -447,8 +481,10 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let recent = recent.build()?;
 
     let file_menu = SubmenuBuilder::new(app, "File")
+        .item(&new_window)
         .item(&new_file)
         .item(&new_folder)
+        .separator()
         .item(&open_folder)
         .item(&recent)
         .separator()
@@ -580,23 +616,70 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Enable/disable the state-gated menu items: `doc` = an active markdown
-/// document, `tab` = any open tab, `folder` = an open workspace. Async so the
-/// call never runs on the UI thread; the menu mutation itself hops back to
-/// the main thread, where macOS requires it.
+/// Enable/disable the state-gated menu items for the calling window: `doc` =
+/// an active markdown document, `tab` = any open tab, `folder` = an open
+/// workspace. Async so the call never runs on the UI thread; the menu mutation
+/// itself hops back to the main thread, where macOS requires it.
 #[tauri::command]
-async fn set_menu_state(app: tauri::AppHandle, doc: bool, tab: bool, folder: bool) {
+async fn set_menu_state(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    doc: bool,
+    tab: bool,
+    folder: bool,
+) {
+    let label = window.label().to_string();
     {
         let ms = app.state::<MenuState>();
-        *ms.enabled.lock().unwrap_or_else(|e| e.into_inner()) = (doc, tab, folder);
+        ms.per_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(label.clone(), (doc, tab, folder));
     }
+    // One menu bar, many windows: only repaint it if this window is the one
+    // it's currently showing. Otherwise a background window's state would
+    // grey out the menu in front of the user.
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let ms = handle.state::<MenuState>();
-        for (item, gate) in ms.gated.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-            let _ = item.set_enabled(gate_on(*gate, doc, tab, folder));
+        let showing = ms.focused.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if showing.as_deref() == Some(label.as_str()) {
+            ms.apply(Some(&label));
         }
     });
+}
+
+/// The window the user is looking at. `Manager::get_focused_window` is behind
+/// Tauri's `unstable` feature, so ask the windows themselves.
+fn focused_label(app: &tauri::AppHandle) -> Option<String> {
+    app.webview_windows()
+        .into_iter()
+        .find(|(_, w)| w.is_focused().unwrap_or(false))
+        .map(|(label, _)| label)
+}
+
+/// Open another window. Each one carries its own workspace, tabs and watcher —
+/// mad is a folder-at-a-time editor, and this is how you get two folders.
+#[tauri::command]
+async fn new_window(app: tauri::AppHandle) -> Result<(), String> {
+    // Reuse the lowest free label so the window-state plugin's saved geometry
+    // gets reused too, rather than accumulating an entry per window ever made.
+    let taken: std::collections::HashSet<String> = app.webview_windows().into_keys().collect();
+    let label = (2..100)
+        .map(|n| format!("mad-{n}"))
+        .find(|l| !taken.contains(l))
+        .ok_or("Too many windows are already open")?;
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::default())
+        .title("mad")
+        .inner_size(1240.0, 820.0)
+        .min_inner_size(760.0, 480.0)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(19.0, 27.0))
+        .disable_drag_drop_handler()
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Record a folder as recently opened; persists and rebuilds the menu.
@@ -1846,13 +1929,22 @@ fn remap_event_path(canon_root: &Path, user_root: &Path, p: PathBuf) -> PathBuf 
 /// and the open document stay in step with edits made outside the app.
 /// Async: swapping watchers joins an FSEvents run loop — not main-thread work.
 #[tauri::command]
-async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+async fn watch_folder(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    path: String,
+) -> Result<(), String> {
     scope().check_root(&path)?;
     let canon_root = fs::canonicalize(&path).map_err(friendly_io)?;
+    let label = window.label().to_string();
     let state = app.state::<FsWatcher>();
-    // Drop the previous watcher first; that closes its channel and ends the
-    // debounce thread below.
-    *state.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    // Drop this window's previous watcher first; that closes its channel and
+    // ends the debounce thread below. Other windows keep theirs.
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&label);
 
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -1862,7 +1954,11 @@ async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String>
     watcher
         .watch(Path::new(&path), notify::RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
-    *state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+    state
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(label.clone(), watcher);
 
     let handle = app.clone();
     let root = PathBuf::from(&path);
@@ -1917,7 +2013,7 @@ async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String>
             // The workspace itself may be what changed: deleted or renamed
             // away. Tell the frontend instead of going silently stale.
             if !root.exists() {
-                let _ = handle.emit("root-gone", ());
+                let _ = handle.emit_to(label.as_str(), "root-gone", ());
                 return;
             }
             if paths.is_empty() && !git {
@@ -1942,7 +2038,13 @@ async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String>
                 bulk,
                 git,
             };
-            if handle.emit("fs-change", payload).is_err() {
+            // Only the window that asked for this folder hears about it —
+            // another window watching a different folder must not be told to
+            // reload files it has never seen.
+            if handle
+                .emit_to(label.as_str(), "fs-change", payload)
+                .is_err()
+            {
                 return;
             }
         }
@@ -1952,39 +2054,67 @@ async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String>
 
 // -------------------------------------------------------------- quit flow
 
-/// One quit attempt in flight. `acked` records that the webview received the
-/// flush-and-exit event and now owns the flow; `generation` invalidates the
-/// backstop of a superseded attempt.
+/// One quit attempt in flight, across every open window.
+///
+/// ⌘Q has to get consent from all of them: each window flushes its own
+/// document and answers. `acked` is who received the request at all;
+/// `confirmed` is who is ready to go. `generation` invalidates the backstop of
+/// a superseded attempt.
 struct ExitFlow(Arc<ExitFlowState>);
 
 #[derive(Default)]
 struct ExitFlowState {
-    acked: AtomicBool,
     generation: AtomicUsize,
+    acked: Mutex<HashSet<String>>,
+    confirmed: Mutex<HashSet<String>>,
 }
 
 /// Should the exit backstop force-quit? Only when its own attempt is still
-/// current and the webview never acknowledged it. There is deliberately no
+/// current and *no* window acknowledged it. There is deliberately no
 /// wall-clock cap after an ack: the flush may legitimately sit on a native
 /// dialog (unsaved draft, save conflict) for as long as the user ponders it,
 /// and a timer racing that dialog is how work gets destroyed. A webview that
 /// acks and then dies is recovered by the *next* quit attempt — a fresh
 /// generation it can no longer ack.
-fn backstop_fires(spawned_gen: usize, current_gen: usize, acked: bool) -> bool {
-    spawned_gen == current_gen && !acked
+fn backstop_fires(spawned_gen: usize, current_gen: usize, any_acked: bool) -> bool {
+    spawned_gen == current_gen && !any_acked
 }
 
-/// Called by the frontend once pending edits are flushed; exits for real.
+/// Have all the windows that still exist agreed to quit?
+///
+/// Compared against the live window list rather than a count taken when the
+/// quit began: a window that closes itself mid-flow must not leave ⌘Q waiting
+/// forever for an answer that can no longer come.
+fn everyone_confirmed(confirmed: &HashSet<String>, open: &[String]) -> bool {
+    !open.is_empty() && open.iter().all(|l| confirmed.contains(l))
+}
+
+/// Called by a window once its pending edits are flushed. The app exits when
+/// the last window has said yes.
 #[tauri::command]
-fn confirm_exit(app: tauri::AppHandle) {
-    app.exit(0);
+fn confirm_exit(app: tauri::AppHandle, window: tauri::Window) {
+    let st = app.state::<ExitFlow>().0.clone();
+    let open: Vec<String> = app.webview_windows().into_keys().collect();
+    let done = {
+        let mut confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+        confirmed.insert(window.label().to_string());
+        everyone_confirmed(&confirmed, &open)
+    };
+    if done {
+        app.exit(0);
+    }
 }
 
-/// First thing the frontend calls on `flush-and-exit`: proves the webview is
+/// First thing a window calls on `flush-and-exit`: proves the webview is
 /// alive, which disarms the force-quit backstop for this attempt.
 #[tauri::command]
-fn exit_ack(state: tauri::State<ExitFlow>) {
-    state.0.acked.store(true, Ordering::SeqCst);
+fn exit_ack(app: tauri::AppHandle, window: tauri::Window) {
+    app.state::<ExitFlow>()
+        .0
+        .acked
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(window.label().to_string());
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1998,12 +2128,17 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(Recents(Mutex::new(Vec::new())));
-            app.manage(MenuState {
-                gated: Mutex::new(Vec::new()),
-                enabled: Mutex::new((false, false, false)),
-            });
-            app.manage(FsWatcher(Mutex::new(None)));
+            app.manage(MenuState::default());
+            app.manage(FsWatcher::default());
             app.manage(ExitFlow(Arc::new(ExitFlowState::default())));
+            // The window that exists at startup owns the menu bar until focus
+            // says otherwise.
+            if let Some(w) = app.webview_windows().keys().next() {
+                *app.state::<MenuState>()
+                    .focused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(w.clone());
+            }
             rebuild_menu(&handle)?;
             // Reading the recents means stat'ing every entry, and a stale
             // network mount can hang a stat for its full mount timeout — so
@@ -2042,6 +2177,24 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
+            // One menu bar drives whichever window is in front: ⌘S must save
+            // *that* document, not fire in every window at once.
+            let to_focused = |ev: &str, payload: Option<i32>| match focused_label(app) {
+                Some(label) => {
+                    let _ = match payload {
+                        Some(p) => app.emit_to(label.as_str(), ev, p),
+                        None => app.emit_to(label.as_str(), ev, ()),
+                    };
+                }
+                // No window has focus (menu used with everything minimised):
+                // nothing sensible to target, so let every window decide.
+                None => {
+                    let _ = match payload {
+                        Some(p) => app.emit(ev, p),
+                        None => app.emit(ev, ()),
+                    };
+                }
+            };
             // Menu items that are just a named signal to the frontend.
             const FORWARD: [(&str, &str); 20] = [
                 ("open_folder", "menu-open-folder"),
@@ -2066,18 +2219,18 @@ pub fn run() {
                 ("check_updates", "menu-check-updates"),
             ];
             if let Some((_, ev)) = FORWARD.iter().find(|(k, _)| *k == id) {
-                let _ = app.emit(ev, ());
+                to_focused(ev, None);
                 return;
             }
             match id {
-                "zoom_in" => {
-                    let _ = app.emit("menu-zoom", 1i32);
-                }
-                "zoom_out" => {
-                    let _ = app.emit("menu-zoom", -1i32);
-                }
-                "zoom_reset" => {
-                    let _ = app.emit("menu-zoom", 0i32);
+                "zoom_in" => to_focused("menu-zoom", Some(1)),
+                "zoom_out" => to_focused("menu-zoom", Some(-1)),
+                "zoom_reset" => to_focused("menu-zoom", Some(0)),
+                "new_window" => {
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = new_window(handle).await;
+                    });
                 }
                 "clear_recents" => {
                     if let Some(state) = app.try_state::<Recents>() {
@@ -2089,7 +2242,7 @@ pub fn run() {
                 "close_window" => {
                     // Through close(), not destroy(): the frontend's
                     // close-requested flush still runs.
-                    if let Some(w) = app.get_webview_window("main") {
+                    if let Some(w) = focused_label(app).and_then(|l| app.get_webview_window(&l)) {
                         let _ = w.close();
                     }
                 }
@@ -2108,7 +2261,18 @@ pub fn run() {
                 }
                 other => {
                     if let Some(path) = other.strip_prefix("recent::") {
-                        let _ = app.emit("menu-open-recent", path.to_string());
+                        match focused_label(app) {
+                            Some(label) => {
+                                let _ = app.emit_to(
+                                    label.as_str(),
+                                    "menu-open-recent",
+                                    path.to_string(),
+                                );
+                            }
+                            None => {
+                                let _ = app.emit("menu-open-recent", path.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -2142,9 +2306,49 @@ pub fn run() {
             git_discard,
             git_discard_kind,
             watch_folder,
+            new_window,
             confirm_exit,
             exit_ack
         ])
+        .on_window_event(|window, event| {
+            let app = window.app_handle();
+            match event {
+                // The menu bar belongs to whoever is in front.
+                tauri::WindowEvent::Focused(true) => {
+                    let label = window.label().to_string();
+                    let ms = app.state::<MenuState>();
+                    *ms.focused.lock().unwrap_or_else(|e| e.into_inner()) = Some(label.clone());
+                    ms.apply(Some(&label));
+                }
+                tauri::WindowEvent::Destroyed => {
+                    let label = window.label().to_string();
+                    // Stop watching that window's folder, and forget its menu
+                    // state — otherwise a reused label inherits it.
+                    app.state::<FsWatcher>()
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&label);
+                    let ms = app.state::<MenuState>();
+                    ms.per_window
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&label);
+                    // A window closing during ⌘Q can be the last answer the
+                    // quit was waiting on — re-check rather than hang.
+                    let st = app.state::<ExitFlow>().0.clone();
+                    let open: Vec<String> = app.webview_windows().into_keys().collect();
+                    let done = {
+                        let confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
+                        !confirmed.is_empty() && everyone_confirmed(&confirmed, &open)
+                    };
+                    if done {
+                        app.exit(0);
+                    }
+                }
+                _ => {}
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
@@ -2154,19 +2358,31 @@ pub fn run() {
             // simply stands down to stay. confirm_exit's app.exit(0) re-enters
             // here with code Some(0) and falls straight through.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-                if code.is_none() {
+                // Windows all closed: nothing to ask, let the app go.
+                if code.is_none() && !app.webview_windows().is_empty() {
                     api.prevent_exit();
                     let st = app.state::<ExitFlow>().0.clone();
                     let gen = st.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                    st.acked.store(false, Ordering::SeqCst);
+                    st.acked.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    st.confirmed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear();
+                    // Every window flushes its own document and answers; the
+                    // app exits when the last one agrees.
                     let _ = app.emit("flush-and-exit", ());
-                    // Backstop for a webview that never answers at all (dead,
+                    // Backstop for webviews that never answer at all (dead,
                     // hung, or not yet loaded — no user edits can exist then).
                     let handle = app.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_secs(5));
                         let current = st.generation.load(Ordering::SeqCst);
-                        if backstop_fires(gen, current, st.acked.load(Ordering::SeqCst)) {
+                        let any_acked = !st
+                            .acked
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_empty();
+                        if backstop_fires(gen, current, any_acked) {
                             handle.exit(0);
                         }
                     });
@@ -3332,12 +3548,63 @@ mod tests {
 
     #[test]
     fn the_exit_backstop_only_fires_for_a_silent_current_attempt() {
-        // Webview never answered: force-quit is correct.
+        // No window answered at all: force-quit is correct.
         assert!(backstop_fires(1, 1, false));
-        // Webview acked: it owns the flow now, no wall clock may cut it short.
+        // Someone acked: they own the flow now, no wall clock may cut it short.
         assert!(!backstop_fires(1, 1, true));
         // A newer quit attempt superseded this backstop: stand down.
         assert!(!backstop_fires(1, 2, false));
+    }
+
+    #[test]
+    fn quitting_waits_for_every_open_window() {
+        let open = vec!["main".to_string(), "mad-2".to_string()];
+        let mut confirmed = HashSet::new();
+
+        confirmed.insert("main".to_string());
+        assert!(
+            !everyone_confirmed(&confirmed, &open),
+            "one window agreeing must not quit the app out from under the other"
+        );
+
+        confirmed.insert("mad-2".to_string());
+        assert!(everyone_confirmed(&confirmed, &open));
+    }
+
+    #[test]
+    fn a_window_that_closes_mid_quit_stops_being_waited_on() {
+        // The straggler goes away instead of answering: what's left has
+        // already agreed, so the quit completes rather than hanging.
+        let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
+        assert!(everyone_confirmed(&confirmed, &["main".to_string()]));
+    }
+
+    #[test]
+    fn quitting_with_no_windows_left_is_not_everyone_agreeing() {
+        // An empty window list must not read as unanimous consent — that
+        // would let a stale confirmed-set exit the app at the wrong moment.
+        let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
+        assert!(!everyone_confirmed(&confirmed, &[]));
+    }
+
+    #[test]
+    fn menu_state_follows_the_focused_window() {
+        let ms = MenuState::default();
+        ms.per_window
+            .lock()
+            .unwrap()
+            .insert("main".into(), (true, true, true));
+        ms.per_window
+            .lock()
+            .unwrap()
+            .insert("mad-2".into(), (false, false, false));
+
+        // Each window sees its own document's state…
+        assert_eq!(ms.state_for(Some("main")), (true, true, true));
+        assert_eq!(ms.state_for(Some("mad-2")), (false, false, false));
+        // …and a window we've heard nothing from yet has nothing open.
+        assert_eq!(ms.state_for(Some("mad-9")), (false, false, false));
+        assert_eq!(ms.state_for(None), (false, false, false));
     }
 
     // -------------------------------------------------- write-path hardening

@@ -181,7 +181,7 @@ Nor does it lose work:
 | --- | --- |
 | `⌘P` / `⌘⇧P` (or `⌘K`) | Go to file / command palette |
 | `⌘⇧O` | Go to heading in this document |
-| `⌘N` / `⌘⇧N` | New file / new folder |
+| `⌘N` / `⌘⇧N` | New file / new window |
 | `⌘O` | Open folder |
 | `⌘S` / `⌘⇧S` | Save / Save As |
 | `⌘W` / `⌘⇧W` | Close tab / close window |

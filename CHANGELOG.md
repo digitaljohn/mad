@@ -5,6 +5,16 @@ a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
 ## Unreleased
 
+### Added
+
+- **Multiple windows.** File ▸ New Window (⇧⌘N) opens another window with its
+  own folder, tabs, file watching and session — so two projects can be open
+  side by side. The menu bar follows whichever window is in front, and ⌘Q
+  asks every window before the app quits.
+  - New Folder gives up ⇧⌘N (it's in the tree's context menu, where it acts
+    on a folder you picked), matching how macOS apps that already spend ⌘N on
+    a new document assign ⇧⌘N to New Window.
+
 ### Fixed — data safety
 
 - Discarding changes to a file whose name contains `[`, `]`, `*` or `?` could

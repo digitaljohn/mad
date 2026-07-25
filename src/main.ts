@@ -22,8 +22,10 @@ import {
 } from "./paths";
 import {
   clampScale,
+  clearSession,
   loadSession,
   saveSession as persistSession,
+  sessionKey,
   usableTabs,
   type Session,
 } from "./session";
@@ -48,7 +50,14 @@ interface Tab {
 async function init() {
   const backend = await createBackend();
   if (isTauri) document.body.classList.add("tauri");
-  const saved = loadSession(localStorage);
+  // Every window has its own workspace, tabs and session; localStorage is
+  // shared, so the label is what keeps them apart.
+  const winLabel = isTauri
+    ? (await import("@tauri-apps/api/window")).getCurrentWindow().label
+    : "main";
+  const isMainWindow = winLabel === "main";
+  const SESSION = sessionKey(winLabel);
+  const saved = loadSession(localStorage, SESSION);
 
   const welcome = $("welcome");
   const editorEl = $("editor");
@@ -91,7 +100,7 @@ async function init() {
   const saveSession = () => {
     clearTimeout(sessionTimer);
     sessionTimer = setTimeout(
-      () => persistSession(localStorage, buildSession()),
+      () => persistSession(localStorage, buildSession(), SESSION),
       250,
     );
   };
@@ -924,6 +933,20 @@ async function init() {
     if (picked) await setRoot(picked);
   };
 
+  /** Another window, with its own workspace. */
+  const newWindow = async () => {
+    if (!isTauri) {
+      toast("Multiple windows need the desktop app.", { kind: "error" });
+      return;
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      await invoke("new_window");
+    } catch (e) {
+      toastError("Couldn’t open a new window", e);
+    }
+  };
+
   /** The workspace itself vanished — deleted, unmounted or renamed away. */
   const onRootGone = async () => {
     const name = rootPath ? baseOf(rootPath) : "The folder";
@@ -1057,14 +1080,24 @@ async function init() {
 
   // ---------------------------------------------------------------- theme
   const THEME_KEY = "mad:theme";
+  /** Tell the other windows a shared preference moved. */
+  const broadcastPrefs = async () => {
+    if (!isTauri) return;
+    const { emit } = await import("@tauri-apps/api/event");
+    void emit("prefs-changed", winLabel).catch(() => {});
+  };
   const applyTheme = (light: boolean) => {
     document.documentElement.classList.toggle("light", light);
     localStorage.setItem(THEME_KEY, light ? "light" : "dark");
     editor.setMermaidTheme(light);
   };
   applyTheme(localStorage.getItem(THEME_KEY) === "light");
-  const toggleTheme = () =>
+  const toggleTheme = () => {
     applyTheme(!document.documentElement.classList.contains("light"));
+    // Theme is an app-wide preference, not a per-window one — a light window
+    // beside a dark one is nobody's intention.
+    void broadcastPrefs();
+  };
 
   // ----------------------------------------------------------------- zoom
   const applyScale = () => {
@@ -1278,7 +1311,8 @@ async function init() {
   }
   const commands: Command[] = [
     { title: "New File", hint: "⌘N", run: () => void newDraft() },
-    { title: "New Folder", hint: "⌘⇧N", run: () => newFolderHere() },
+    { title: "New Window", hint: "⌘⇧N", run: () => void newWindow() },
+    { title: "New Folder", run: () => newFolderHere(), when: () => !!rootPath },
     { title: "Open Folder…", hint: "⌘O", run: () => void openFolder() },
     { title: "Save", hint: "⌘S", run: () => void save(), when: isMd },
     { title: "Save As…", hint: "⌘⇧S", run: () => void saveAs(), when: isMd },
@@ -1616,8 +1650,8 @@ async function init() {
       case "new-file":
         void newDraft();
         break;
-      case "new-folder":
-        newFolderHere();
+      case "new-window":
+        void newWindow();
         break;
       case "toggle-source":
         if (isMd()) editor.toggleMode();
@@ -1639,47 +1673,65 @@ async function init() {
     const { invoke } = await import("@tauri-apps/api/core");
     const { openUrl } = await import("@tauri-apps/plugin-opener");
 
-    // Flush edits before quitting — with no wall-clock cap. The flush may
-    // legitimately sit on a native dialog (draft warning, save conflict) for
-    // as long as the user ponders it; the Rust backstop only covers a webview
-    // that never answers at all.
-    let exiting = false;
-    const flushThenExit = async () => {
-      // ALWAYS ack first, even when re-entered: every ExitRequested arms a
-      // fresh backstop, and each one must learn the webview is alive.
-      void invoke("exit_ack").catch(() => {});
-      if (exiting) return; // one dialog, one flush — however many ⌘Qs arrive
-      exiting = true;
+    // Put this window's work safely on disk, asking about anything that would
+    // be lost. Resolves false if the user decided to stay.
+    //
+    // No wall-clock cap: the flush may legitimately sit on a native dialog
+    // (draft warning, save conflict) for as long as the user ponders it; the
+    // Rust backstop only covers a webview that never answers at all.
+    let settling = false;
+    const settle = async (verb: string): Promise<boolean> => {
+      if (settling) return false; // one dialog, one flush, however many asks
+      settling = true;
       // localStorage is synchronous — the session survives even a hung flush.
       clearTimeout(sessionTimer);
-      persistSession(localStorage, buildSession());
+      persistSession(localStorage, buildSession(), SESSION);
       // Warn before losing an unsaved draft (drafts never autosave).
       if (hasUnsavedDraft()) {
         const proceed = await backend.confirm(
           "Unsaved file",
-          "You have an unsaved file that will be lost. Quit without saving?",
+          `You have an unsaved file that will be lost. ${verb} without saving?`,
         );
         if (!proceed) {
-          exiting = false; // stand down — nothing is pending on the Rust side
-          return;
+          settling = false; // stand down — nothing is pending on the Rust side
+          return false;
         }
       }
-      try {
-        await editor.flush();
-      } finally {
+      await editor.flush();
+      return true;
+    };
+
+    // ⌘Q: every window settles and answers; the app exits once the last one
+    // agrees. A window that stands down simply never confirms, so the quit
+    // quietly stops — the same "no" it has always meant.
+    void listen("flush-and-exit", async () => {
+      // ALWAYS ack first, even when re-entered: every ExitRequested arms a
+      // fresh backstop, and each one must learn this webview is alive.
+      void invoke("exit_ack").catch(() => {});
+      if (await settle("Quit")) {
         void invoke("confirm_exit").catch(() => {
-          exiting = false; // IPC failed — allow another attempt over wedging
+          settling = false; // IPC failed — allow another attempt over wedging
         });
       }
-    };
-    void getCurrentWindow().onCloseRequested(async (e) => {
-      e.preventDefault();
-      await flushThenExit();
     });
-    void listen("flush-and-exit", flushThenExit);
+
+    // Closing a window is not quitting the app: settle this window's work,
+    // then destroy only this window. (Tauri exits on its own once the last
+    // one is gone.)
+    const thisWindow = getCurrentWindow();
+    void thisWindow.onCloseRequested(async (e) => {
+      e.preventDefault();
+      if (!(await settle("Close"))) return;
+      // Extra windows are ephemeral — leaving their session behind would
+      // accumulate dead keys in localStorage forever.
+      if (!isMainWindow) clearSession(localStorage, SESSION);
+      await thisWindow.destroy();
+    });
 
     // Native menu items.
     const menu: Record<string, () => void> = {
+      // Note: New Window has no entry here — Rust creates the window itself,
+      // so it works even when no window has focus to forward the event to.
       "menu-open-folder": () => void openFolder(),
       "menu-new-file": () => void newDraft(),
       "menu-new-folder": () => newFolderHere(),
@@ -1720,9 +1772,16 @@ async function init() {
       },
     );
 
+    // A shared preference changed in another window — adopt it.
+    void listen<string>("prefs-changed", (e) => {
+      if (e.payload === winLabel) return; // our own broadcast
+      applyTheme(localStorage.getItem(THEME_KEY) === "light");
+    });
+
     // A quiet look for a newer release once the app has settled. Silent, so a
-    // missing manifest or no network never interrupts anyone.
-    setTimeout(() => runUpdateCheck(true), 4000);
+    // missing manifest or no network never interrupts anyone — and only from
+    // the first window, or every window would race for the same download.
+    if (isMainWindow) setTimeout(() => runUpdateCheck(true), 4000);
 
     // External links open in the system browser, not the webview.
     document.addEventListener(

@@ -33,7 +33,7 @@ export type KeyAction =
   | { kind: "save" }
   | { kind: "save-as" }
   | { kind: "new-file" }
-  | { kind: "new-folder" }
+  | { kind: "new-window" }
   | { kind: "toggle-source" }
   | { kind: "toggle-split" };
 
@@ -80,7 +80,9 @@ export function resolveKey(k: KeyStroke, ctx: KeyContext): KeyAction | null {
   if (k.code === "Digit0") return { kind: "zoom", delta: 0 };
   if (k.code === "KeyS" && k.shift) return { kind: "save-as" };
   if (k.code === "KeyS") return { kind: "save" };
-  if (k.code === "KeyN" && k.shift) return { kind: "new-folder" };
+  // ⇧⌘N is New Window, matching every macOS app where ⌘N already makes a
+  // document. New Folder lives in the tree's context menu instead.
+  if (k.code === "KeyN" && k.shift) return { kind: "new-window" };
   if (k.code === "KeyN") return { kind: "new-file" };
   if (k.code === "KeyM" && k.shift) return { kind: "toggle-source" };
   if (k.code === "KeyV" && k.shift) return { kind: "toggle-split" };

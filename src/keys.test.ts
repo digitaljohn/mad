@@ -98,7 +98,7 @@ describe("resolveKey", () => {
       ["KeyS", {}, { kind: "save" }],
       ["KeyS", { shift: true }, { kind: "save-as" }],
       ["KeyN", {}, { kind: "new-file" }],
-      ["KeyN", { shift: true }, { kind: "new-folder" }],
+      ["KeyN", { shift: true }, { kind: "new-window" }],
       ["KeyM", { shift: true }, { kind: "toggle-source" }],
       ["KeyV", { shift: true }, { kind: "toggle-split" }],
     ] as const)("maps %s %o", (code, mods, expected) => {
