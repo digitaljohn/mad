@@ -5,9 +5,14 @@ priority over everything else.
 
 ## Reporting a vulnerability
 
-Please **do not open a public issue** for anything security-sensitive.
-Instead, use GitHub's private reporting:
+Please **do not put details in a public issue.**
+
+Use GitHub's private reporting:
 [Report a vulnerability](https://github.com/digitaljohn/mad/security/advisories/new).
+
+If that page is unavailable, open a public issue saying only *"security report,
+please open a private channel"* — no specifics — and you'll be invited to a
+private advisory. Never the details in the open.
 
 You should hear back within a few days. Fixes ship as a patch release through
 the built-in updater, which is the fastest path to every installed copy.

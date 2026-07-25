@@ -85,8 +85,11 @@ jobs:
 
       - name: Test the Rust side before shipping
         # The Rust half owns every filesystem operation — the one thing a
-        # release must not ship unverified. After the cache step, so the
-        # dependency build here warms the same cache the bundle build uses.
+        # release must not ship unverified.
+        #
+        # This costs a separate host-target debug build; it shares nothing
+        # with the universal release bundle below. That is the price of
+        # gating the release on the tests, and it is worth paying.
         run: |
           cargo fmt --manifest-path src-tauri/Cargo.toml --check
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
@@ -279,10 +282,15 @@ jobs:
           EOF
           # A retry after a half-finished publish must not die on "release
           # already exists" — fall back to (re)uploading the assets into it.
-          if ! gh release create "v${VERSION}" dist-release/* \
+          # `created` records which path we took: only a release this run
+          # brought into existence may be cleaned up on failure.
+          if gh release create "v${VERSION}" dist-release/* \
             --title "mad ${VERSION}" \
             --notes-file notes.md \
             --verify-tag; then
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "created=false" >> "$GITHUB_OUTPUT"
             echo "Release exists (or create failed) — uploading assets into it."
             gh release upload "v${VERSION}" dist-release/* --clobber
           fi
@@ -290,10 +298,13 @@ jobs:
       - name: Remove a partial release on failure
         # A release missing assets is worse than none: `latest` resolves to it
         # and the updater 404s. Delete the release (never the tag) so a plain
-        # re-run of this workflow can publish cleanly. Scoped to failures of
-        # the publish step itself — a re-run of an already-published tag that
-        # dies in an earlier step must NOT take the good release down.
-        if: ${{ failure() && github.ref_type == 'tag' && steps.publish.outcome == 'failure' }}
+        # re-run of this workflow can publish cleanly.
+        #
+        # Gated on `created`, not merely on the step failing: re-running an
+        # already-published tag takes the upload path, and if THAT fails we
+        # must leave the existing good release alone rather than delete the
+        # very thing users are downloading.
+        if: ${{ failure() && github.ref_type == 'tag' && steps.publish.outputs.created == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}

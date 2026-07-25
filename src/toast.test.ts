@@ -95,11 +95,20 @@ describe("toast", () => {
     expect(document.querySelectorAll(".toast")).toHaveLength(1);
   });
 
-  it("dismissing twice removes the toast exactly once", () => {
+  it("dismissing twice schedules exactly one removal", () => {
+    // Asserting "the toast is gone" would pass either way — removing an
+    // already-detached node is a silent no-op. What the guard actually
+    // prevents is a second scheduled removal, so count the timers.
     vi.useFakeTimers();
     const h = toast("Working", { duration: 0 });
+    const scheduled = vi.getTimerCount();
     h.dismiss();
+    const afterFirst = vi.getTimerCount();
     h.dismiss(); // an action click and the duration timer can both land here
+    expect(vi.getTimerCount(), "second dismiss queued another removal").toBe(
+      afterFirst,
+    );
+    expect(afterFirst).toBeGreaterThan(scheduled);
     vi.advanceTimersByTime(400);
     expect(document.querySelectorAll(".toast")).toHaveLength(0);
     vi.useRealTimers();

@@ -273,9 +273,16 @@ describe("git decorations", () => {
 
   it("survives a git update while a row is being renamed", () => {
     tree.startRename("/w/README.md");
-    // The rename row has no badge slot — patching must skip it, not corrupt it.
     tree.setGit(info([{ path: "/w/README.md", status: "modified" }]));
-    expect(container.querySelector(".rename-input")).toBeTruthy();
+    const row = container.querySelector<HTMLElement>(
+      `[data-path="${CSS.escape("/w/README.md")}"]`,
+    )!;
+    // The input survives…
+    expect(row.querySelector(".rename-input")).toBeTruthy();
+    // …and no stray badge is appended beside it. Without the skip, patching
+    // decorates the rename row with a letter that has nowhere to sit, which
+    // is what "corrupt it" actually looks like.
+    expect(row.querySelector(".git-badge")).toBe(null);
   });
 
   it("clears every mark when the folder stops being a repository", () => {
