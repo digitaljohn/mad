@@ -42,9 +42,16 @@ Frontend tests sit beside the module they cover — `src/paths.ts` →
 
 ## What coverage means here
 
-The frontend modules under test are at **100% statements, functions and lines**,
-with branches a fraction under (the enforced floor is 99%). Thresholds in
-`vitest.config.ts` fail the build on a regression, so this doesn't quietly rot.
+The frontend modules under test sit at **100% functions and lines**, with
+statements and branches just under. The enforced floor in `vitest.config.ts`
+is **95%** across the board — a floor, not a target: it fails the build when
+real coverage slips without demanding tests for defensive branches that no
+call path reaches.
+
+Vitest 4 maps coverage through the AST rather than by line, so it counts
+guards the old provider silently credited. The same code measures a little
+lower than it used to without anything having got worse — worth knowing
+before you go hunting a regression that isn't there.
 
 The number is only worth reading if you know what it covers, so:
 

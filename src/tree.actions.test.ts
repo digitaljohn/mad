@@ -230,6 +230,53 @@ describe("Copy Path", () => {
     expect(document.querySelector("textarea")).toBe(null);
     expect(toastTexts()).toContain("Path copied");
   });
+
+  it("says so when even the fallback fails, rather than claiming success", async () => {
+    // Both routes blocked. Silence here would leave the user believing a
+    // path was on their clipboard when nothing was.
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn(async () => {
+          throw new Error("NotAllowedError");
+        }),
+      },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        throw new Error("blocked");
+      },
+    });
+
+    openRowMenu("/w/README.md");
+    clickItem("Copy Path");
+    await vi.waitFor(() => expect(toastTexts()).toContain("Couldn’t copy path"));
+    expect(toastTexts()).not.toContain("Path copied");
+  });
+
+  it("reports a failed copy of the workspace root too", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn(async () => {
+          throw new Error("NotAllowedError");
+        }),
+      },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        throw new Error("blocked");
+      },
+    });
+
+    openRootMenu();
+    clickItem("Copy Path");
+    await vi.waitFor(() => expect(toastTexts()).toContain("Couldn’t copy path"));
+  });
 });
 
 describe("menu dismissal", () => {
