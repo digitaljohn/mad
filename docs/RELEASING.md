@@ -16,9 +16,9 @@ publishes a GitHub Release with the `.dmg`, a `.app.tar.gz` and `SHA256SUMS.txt`
 CI refuses to publish if the tag and the app version disagree, so a `v0.2.0`
 release can never ship a binary that calls itself `0.1.0`.
 
-To rehearse without publishing: **Actions → Release → Run workflow**, leaving
-*dry run* ticked. It builds and uploads the artifacts to the run, and creates no
-release.
+To rehearse without publishing: **Actions → Release → Run workflow**. A manual
+run always builds and uploads the artifacts to the run itself and publishes
+nothing — only a tag creates a release.
 
 ## The signing question
 

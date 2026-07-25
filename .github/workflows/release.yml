@@ -3,13 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Lets you rehearse the whole thing without publishing anything.
+  # Rehearsal: builds and uploads the artifacts to the run, publishes nothing.
+  # Only a tag publishes a release.
   workflow_dispatch:
-    inputs:
-      dry-run:
-        description: "Build and check, but publish nothing"
-        type: boolean
-        default: true
 
 permissions:
   contents: write # required to create the release
@@ -20,6 +16,13 @@ jobs:
   macos:
     name: macOS universal
     runs-on: macos-latest
+    # Job level, not step level: a step's own `env:` block is not in scope for
+    # that same step's `if:` condition, so a step gated on its own env never
+    # runs. Apple signing is opt-in via these secrets and has to be gated
+    # somewhere that works.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -87,9 +90,6 @@ jobs:
       # change; see docs/RELEASING.md.
       - name: Import the signing certificate
         if: ${{ env.APPLE_CERTIFICATE != '' }}
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
@@ -195,7 +195,7 @@ jobs:
           retention-days: 14
 
       - name: Publish the release
-        if: ${{ github.ref_type == 'tag' && inputs.dry-run != true }}
+        if: ${{ github.ref_type == 'tag' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
