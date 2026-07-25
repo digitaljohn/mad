@@ -137,6 +137,13 @@ src-tauri/
   src/lib.rs   every command, the native menu, the filesystem watcher
 ```
 
+Two source trees, one app: `src/` runs in the webview, `src-tauri/` is the Rust
+process that owns the filesystem. Despite its name, `src-tauri/` contains no
+Tauri — the framework arrives from crates.io like any other dependency, and
+`node_modules/` and `target/` are both gitignored. It's simply where Tauri's CLI
+expects your Rust to live, and every doc page it will ever hand you says
+`src-tauri/…`, so it stays put.
+
 The Rust side owns the filesystem and the native menu; there is no `fs` plugin
 and no asset protocol, so the app ships with a real CSP and no wildcard scopes.
 Images cross the IPC bridge as base64 data URLs. The tests live at the bottom of
