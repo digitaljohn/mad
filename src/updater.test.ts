@@ -145,6 +145,35 @@ describe("checkForUpdates", () => {
     expect(toasts()).not.toContain("Checking for updates…");
   });
 
+  it("dismisses the progress toast when the download itself fails", async () => {
+    const downloadAndInstall = vi.fn(async (onEvent) => {
+      onEvent({ event: "Started", data: { contentLength: 10_000_000 } });
+      onEvent({ event: "Progress", data: { chunkLength: 2_500_000 } });
+      throw new Error("connection reset");
+    });
+    check.mockResolvedValue({ version: "0.3.0", body: "", downloadAndInstall });
+
+    await checkForUpdates(yes);
+
+    // No zombie "Downloading update…" toast pinned forever…
+    expect(toasts().some((t) => t?.includes("Downloading update"))).toBe(false);
+    // …and the user is told the download failed, even on a silent check.
+    expect(toasts().some((t) => t?.includes("connection reset"))).toBe(true);
+    expect(relaunch).not.toHaveBeenCalled();
+  });
+
+  it("reports a failed download even when the check was silent", async () => {
+    const downloadAndInstall = vi.fn(async () => {
+      throw new Error("disk full");
+    });
+    check.mockResolvedValue({ version: "0.3.0", body: "", downloadAndInstall });
+
+    await checkForUpdates(yes, { silent: true });
+
+    // The user explicitly said yes to this download; its failure is theirs to know.
+    expect(toasts().some((t) => t?.includes("disk full"))).toBe(true);
+  });
+
   it("ignores a second check while one is in flight", async () => {
     let release!: () => void;
     check.mockImplementation(() => new Promise((r) => (release = () => r(null))));

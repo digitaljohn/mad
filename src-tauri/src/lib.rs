@@ -1,12 +1,12 @@
 use base64::Engine;
 use notify::Watcher as _;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager, Wry};
@@ -77,6 +77,106 @@ fn in_skipped_dir(root: &Path, path: &Path) -> bool {
         })
 }
 
+// ------------------------------------------------------------------ scope
+
+/// Paths the frontend is allowed to touch. Roots come from the native folder
+/// dialog (or the recents file, whose entries were all dialog-granted once);
+/// individual files come from the save/export dialogs. The webview can never
+/// mint a grant itself — this is defense-in-depth so a compromised renderer
+/// can't leave the workspace.
+#[derive(Default)]
+struct Scope {
+    roots: Mutex<Vec<PathBuf>>,
+    files: Mutex<HashSet<PathBuf>>,
+}
+
+/// Process-global rather than Tauri-managed state, deliberately: `State` has
+/// no public constructor, so managed state would force every test through a
+/// mock app — this way the existing tests call commands directly and still
+/// exercise the real checks (TempDir grants itself on creation).
+fn scope() -> &'static Scope {
+    static S: OnceLock<Scope> = OnceLock::new();
+    S.get_or_init(Scope::default)
+}
+
+fn deny(raw: &str) -> String {
+    let name = Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| raw.to_string());
+    format!("“{name}” is outside the open workspace")
+}
+
+/// Canonicalize for a membership check. A not-yet-existing file resolves
+/// through its parent; `..` is rejected outright so a traversal can't ride in
+/// on a non-existent suffix. Symlinks resolve, so a link pointing out of the
+/// workspace lands outside and fails the membership test.
+fn canonical_target(raw: &str) -> Result<PathBuf, String> {
+    let p = Path::new(raw);
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(deny(raw));
+    }
+    if let Ok(c) = fs::canonicalize(p) {
+        return Ok(c);
+    }
+    let parent = p.parent().ok_or_else(|| deny(raw))?;
+    let name = p.file_name().ok_or_else(|| deny(raw))?;
+    let base = fs::canonicalize(parent).map_err(|_| deny(raw))?;
+    Ok(base.join(name))
+}
+
+impl Scope {
+    fn grant_root(&self, raw: &str) {
+        if let Ok(c) = canonical_target(raw) {
+            let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+            if !roots.contains(&c) {
+                roots.push(c);
+            }
+        }
+    }
+
+    fn grant_file(&self, raw: &str) {
+        if let Ok(c) = canonical_target(raw) {
+            self.files
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(c);
+        }
+    }
+
+    /// Under a granted workspace root.
+    fn check_root(&self, raw: &str) -> Result<(), String> {
+        let c = canonical_target(raw)?;
+        let roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        // starts_with is component-wise: /ws2 is not under /ws.
+        if roots.iter().any(|r| c.starts_with(r)) {
+            Ok(())
+        } else {
+            Err(deny(raw))
+        }
+    }
+
+    /// Under a granted root, or exactly a dialog-granted file.
+    fn check(&self, raw: &str) -> Result<(), String> {
+        if self.check_root(raw).is_ok() {
+            return Ok(());
+        }
+        let c = canonical_target(raw)?;
+        if self
+            .files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&c)
+        {
+            Ok(())
+        } else {
+            Err(deny(raw))
+        }
+    }
+}
+
 // ---------------------------------------------------------------- recents
 
 fn recents_file(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -128,8 +228,17 @@ fn save_recents(app: &tauri::AppHandle, recents: &[String]) {
 /// Build (or rebuild) the whole application menu — reading the current recents
 /// and Save enable-state from managed state — and install it.
 fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let recents = app.state::<Recents>().0.lock().unwrap().clone();
-    let (save_on, save_as_on) = *app.state::<MenuState>().enabled.lock().unwrap();
+    let recents = app
+        .state::<Recents>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let (save_on, save_as_on) = *app
+        .state::<MenuState>()
+        .enabled
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let item = |id: &str, label: &str, accel: Option<&str>| -> tauri::Result<MenuItem<Wry>> {
         let mut b = MenuItemBuilder::with_id(id, label);
@@ -307,8 +416,8 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 
     // Remember the new item handles so set_menu_state can toggle them live.
     let ms = app.state::<MenuState>();
-    *ms.save.lock().unwrap() = Some(save);
-    *ms.save_as.lock().unwrap() = Some(save_as);
+    *ms.save.lock().unwrap_or_else(|e| e.into_inner()) = Some(save);
+    *ms.save_as.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_as);
     Ok(())
 }
 
@@ -316,9 +425,9 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
 #[tauri::command]
 fn set_menu_state(app: tauri::AppHandle, can_save: bool, can_save_as: bool) {
     let ms = app.state::<MenuState>();
-    *ms.enabled.lock().unwrap() = (can_save, can_save_as);
-    let save = ms.save.lock().unwrap().clone();
-    let save_as = ms.save_as.lock().unwrap().clone();
+    *ms.enabled.lock().unwrap_or_else(|e| e.into_inner()) = (can_save, can_save_as);
+    let save = ms.save.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let save_as = ms.save_as.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(it) = save {
         let _ = it.set_enabled(can_save);
     }
@@ -329,14 +438,22 @@ fn set_menu_state(app: tauri::AppHandle, can_save: bool, can_save_as: bool) {
 
 /// Record a folder as recently opened; persists and rebuilds the menu.
 #[tauri::command]
-fn push_recent(app: tauri::AppHandle, state: tauri::State<Recents>, path: String) {
+fn push_recent(
+    app: tauri::AppHandle,
+    state: tauri::State<Recents>,
+    path: String,
+) -> Result<(), String> {
+    // Only dialog-granted roots may enter the recents file — it seeds the
+    // scope on next launch, so an unchecked entry would become a grant.
+    scope().check_root(&path)?;
     let snapshot = {
-        let mut recents = state.0.lock().unwrap();
+        let mut recents = state.0.lock().unwrap_or_else(|e| e.into_inner());
         push_recent_list(&mut recents, path);
         recents.clone()
     };
     save_recents(&app, &snapshot);
     let _ = rebuild_menu(&app);
+    Ok(())
 }
 
 // ------------------------------------------------------------ file system
@@ -344,11 +461,17 @@ fn push_recent(app: tauri::AppHandle, state: tauri::State<Recents>, path: String
 /// Open the native folder picker and return the chosen directory.
 #[tauri::command]
 async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
-    app.dialog()
+    let chosen = app
+        .dialog()
         .file()
         .blocking_pick_folder()
         .and_then(|f| f.into_path().ok())
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| p.to_string_lossy().into_owned());
+    if let Some(p) = &chosen {
+        // The user picked it in a native dialog — that's what a grant is.
+        scope().grant_root(p);
+    }
+    chosen
 }
 
 const SHOWN_EXTS: [&str; 10] = [
@@ -374,6 +497,7 @@ fn is_markdown(path: &Path) -> bool {
 /// Async so filesystem work stays off the main thread.
 #[tauri::command]
 async fn list_dir(path: String) -> Result<Vec<Entry>, String> {
+    scope().check_root(&path)?;
     let mut entries: Vec<Entry> = fs::read_dir(&path)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
@@ -427,17 +551,36 @@ fn stamp_of(path: &Path) -> String {
 /// Just the change stamp — lets the UI answer "did this file change?" without
 /// re-reading its contents on every watcher event (including its own saves).
 #[tauri::command]
-async fn file_stamp(path: String) -> String {
-    stamp_of(Path::new(&path))
+async fn file_stamp(path: String) -> Result<String, String> {
+    scope().check(&path)?;
+    Ok(stamp_of(Path::new(&path)))
 }
+
+/// Turn an io::Error into something a toast can show without a Debug dump.
+fn friendly_io(e: std::io::Error) -> String {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => "The file no longer exists.".into(),
+        PermissionDenied => "You don’t have permission to do that.".into(),
+        StorageFull => "The disk is full.".into(),
+        ReadOnlyFilesystem => "The volume is read-only.".into(),
+        InvalidData => "This file isn’t UTF-8 text.".into(),
+        _ => e.to_string(),
+    }
+}
+
+/// Cap on documents read into the webview. Markdown this size is not a note;
+/// slurping it into a JSON IPC payload would wedge the renderer.
+const MAX_DOC: u64 = 32 * 1024 * 1024;
 
 #[tauri::command]
 async fn read_file(path: String) -> Result<FileData, String> {
+    scope().check(&path)?;
     let p = Path::new(&path);
-    let content = fs::read_to_string(p).map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidData => "This file isn’t UTF-8 text.".to_string(),
-        _ => e.to_string(),
-    })?;
+    if fs::metadata(p).map(|m| m.len() > MAX_DOC).unwrap_or(false) {
+        return Err("This file is too large to open (over 32 MB).".into());
+    }
+    let content = fs::read_to_string(p).map_err(friendly_io)?;
     Ok(FileData {
         stamp: stamp_of(p),
         content,
@@ -460,7 +603,11 @@ async fn write_file(
     content: String,
     expect: Option<String>,
 ) -> Result<String, String> {
-    let target = Path::new(&path);
+    scope().check(&path)?;
+    // Resolve symlinks up front: renaming over a link would replace the link
+    // itself with a regular file, orphaning the real document it points at.
+    let resolved = fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
+    let target = resolved.as_path();
     if let Some(expected) = expect {
         if stamp_of(target) != expected {
             return Err(CONFLICT.to_string());
@@ -471,25 +618,33 @@ async fn write_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "note.md".into());
-    // Hidden temp name in the same directory (same volume ⇒ rename is atomic).
-    let tmp = dir.join(format!(".{name}.mad-tmp"));
+    // Hidden temp name in the same directory (same volume ⇒ rename is atomic),
+    // made unique per write: two overlapping saves must never share one temp,
+    // or one could rename the other's half-written bytes over the real file.
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        ".{name}.{}-{}.mad-tmp",
+        std::process::id(),
+        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
 
     let write = |tmp: &Path| -> std::io::Result<()> {
         let mut f = fs::File::create(tmp)?;
+        // Match the original's permissions before any content goes in, so a
+        // private file is never briefly readable through a default-mode temp.
+        if let Ok(meta) = fs::metadata(target) {
+            let _ = fs::set_permissions(tmp, meta.permissions());
+        }
         f.write_all(content.as_bytes())?;
         f.sync_all()
     };
     if let Err(e) = write(&tmp) {
         let _ = fs::remove_file(&tmp);
-        return Err(e.to_string());
-    }
-    // Keep the original file's permissions across the replace.
-    if let Ok(meta) = fs::metadata(target) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
+        return Err(friendly_io(e));
     }
     if let Err(e) = fs::rename(&tmp, target) {
         let _ = fs::remove_file(&tmp);
-        return Err(e.to_string());
+        return Err(friendly_io(e));
     }
     // Best effort: flush the directory entry so the rename survives a crash.
     if let Ok(d) = fs::File::open(dir) {
@@ -539,6 +694,7 @@ fn safe_file_name(name: &str, fallback: &str) -> String {
 /// Returns the path actually created (deduped with " 2", " 3", …).
 #[tauri::command]
 async fn create_file(dir: String, name: String) -> Result<String, String> {
+    scope().check_root(&dir)?;
     let safe = safe_file_name(&name, "Untitled.md");
     let (stem, ext) = split_name(&safe);
     for n in 1..1000u32 {
@@ -565,12 +721,13 @@ async fn create_file(dir: String, name: String) -> Result<String, String> {
 /// (avoids asset-protocol/webview scheme quirks entirely).
 #[tauri::command]
 async fn read_image(path: String) -> Result<String, String> {
+    scope().check(&path)?;
     const MAX_IMAGE: u64 = 64 * 1024 * 1024;
-    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
+    let meta = fs::metadata(&path).map_err(friendly_io)?;
     if meta.len() > MAX_IMAGE {
         return Err("Image is too large to preview".into());
     }
-    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    let bytes = fs::read(&path).map_err(friendly_io)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
@@ -578,16 +735,37 @@ async fn read_image(path: String) -> Result<String, String> {
 /// Returns the file name to reference relatively from the document.
 #[tauri::command]
 async fn save_image(dir: String, name: String, data: String) -> Result<String, String> {
+    scope().check_root(&dir)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|e| e.to_string())?;
     let safe = safe_file_name(&name, "image.png");
-    let target = unique_path(&dir, &safe);
-    fs::write(&target, bytes).map_err(|e| e.to_string())?;
-    Ok(target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or(safe))
+    let (stem, ext) = split_name(&safe);
+    // create_new, like create_file: a name freed up between the uniqueness
+    // probe and the write must not let this clobber whatever claimed it.
+    for n in 1..1000u32 {
+        let candidate = if n == 1 {
+            Path::new(&dir).join(&safe)
+        } else {
+            Path::new(&dir).join(format!("{stem} {n}{ext}"))
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut f) => {
+                f.write_all(&bytes).map_err(friendly_io)?;
+                return Ok(candidate
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(safe));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(friendly_io(e)),
+        }
+    }
+    Err("Too many images with that name".into())
 }
 
 /// Native Save dialog restricted to markdown. Returns the chosen path with a
@@ -607,7 +785,7 @@ async fn save_dialog(
     if let Some(d) = dir {
         builder = builder.set_directory(d);
     }
-    builder
+    let chosen = builder
         .blocking_save_file()
         .and_then(|f| f.into_path().ok())
         .map(|p| {
@@ -621,7 +799,13 @@ async fn save_dialog(
                 s.push(".md");
                 s.to_string_lossy().into_owned()
             }
-        })
+        });
+    if let Some(p) = &chosen {
+        // Chosen in a native dialog — Save As may legitimately leave the
+        // workspace, and the file stays writable for the rest of the session.
+        scope().grant_file(p);
+    }
+    chosen
 }
 
 /// Native Save dialog for an arbitrary extension (used by Export as HTML).
@@ -641,10 +825,28 @@ async fn export_dialog(
     if let Some(d) = dir {
         builder = builder.set_directory(d);
     }
-    builder
+    let chosen = builder
         .blocking_save_file()
         .and_then(|f| f.into_path().ok())
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            // Same append-only rule as save_dialog: a name typed without the
+            // extension still exports as e.g. `.html`, never rewritten.
+            let has = p
+                .extension()
+                .map(|e| e.to_string_lossy().eq_ignore_ascii_case(&ext))
+                .unwrap_or(false);
+            if has {
+                p.to_string_lossy().into_owned()
+            } else {
+                let mut s = p.into_os_string();
+                s.push(format!(".{ext}"));
+                s.to_string_lossy().into_owned()
+            }
+        });
+    if let Some(p) = &chosen {
+        scope().grant_file(p);
+    }
+    chosen
 }
 
 /// Native OK/Cancel confirmation. Returns true if the user confirmed.
@@ -693,6 +895,8 @@ async fn message(app: tauri::AppHandle, title: String, message: String, error: b
 /// overwrite an existing entry.
 #[tauri::command]
 async fn rename_path(from: String, to: String) -> Result<String, String> {
+    scope().check_root(&from)?;
+    scope().check_root(&to)?;
     if from == to {
         return Ok(to);
     }
@@ -715,14 +919,36 @@ async fn rename_path(from: String, to: String) -> Result<String, String> {
             ));
         }
     }
-    fs::rename(&from, &to).map_err(|e| e.to_string())?;
+    move_path(Path::new(&from), Path::new(&to))?;
     Ok(to)
+}
+
+/// Rename, falling back to copy+delete when source and destination sit on
+/// different volumes (fs::rename cannot cross them).
+fn move_path(from: &Path, to: &Path) -> Result<(), String> {
+    match fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            if from.is_dir() {
+                if let Err(e) = copy_dir(from, to) {
+                    let _ = fs::remove_dir_all(to); // no half-copied tree left behind
+                    return Err(friendly_io(e));
+                }
+                fs::remove_dir_all(from).map_err(friendly_io)
+            } else {
+                fs::copy(from, to).map_err(friendly_io)?;
+                fs::remove_file(from).map_err(friendly_io)
+            }
+        }
+        r => r.map_err(friendly_io),
+    }
 }
 
 /// Move `src` into `dest_dir`. Returns the new path. Refuses to overwrite, and
 /// refuses to move a folder inside itself.
 #[tauri::command]
 async fn move_into(src: String, dest_dir: String) -> Result<String, String> {
+    scope().check_root(&src)?;
+    scope().check_root(&dest_dir)?;
     let src_p = Path::new(&src);
     let name = src_p.file_name().ok_or("Invalid source path")?;
     let dest = Path::new(&dest_dir).join(name);
@@ -739,16 +965,17 @@ async fn move_into(src: String, dest_dir: String) -> Result<String, String> {
             name.to_string_lossy()
         ));
     }
-    fs::rename(&src, &dest).map_err(|e| e.to_string())?;
+    move_path(src_p, &dest)?;
     Ok(dest.to_string_lossy().into_owned())
 }
 
 /// Create a new subfolder, deduping the name if it already exists.
 #[tauri::command]
 async fn create_folder(dir: String, name: String) -> Result<String, String> {
+    scope().check_root(&dir)?;
     let safe = safe_file_name(&name, "New Folder");
     let target = unique_path(&dir, &safe);
-    fs::create_dir(&target).map_err(|e| e.to_string())?;
+    fs::create_dir(&target).map_err(friendly_io)?;
     Ok(target.to_string_lossy().into_owned())
 }
 
@@ -757,7 +984,13 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let dest = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            // Recreate the link itself. Copying through it could pull in an
+            // entire external tree — or die on a dangling link mid-copy.
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &dest)?;
+        } else if ft.is_dir() {
             copy_dir(&entry.path(), &dest)?;
         } else {
             fs::copy(entry.path(), dest)?;
@@ -769,6 +1002,7 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 /// Duplicate a file or folder beside itself as "name copy".
 #[tauri::command]
 async fn duplicate_path(path: String) -> Result<String, String> {
+    scope().check_root(&path)?;
     let p = Path::new(&path);
     let dir = p
         .parent()
@@ -782,10 +1016,19 @@ async fn duplicate_path(path: String) -> Result<String, String> {
         .into_owned();
     let (stem, ext) = split_name(&name);
     let target = unique_path(&dir, &format!("{stem} copy{ext}"));
-    if p.is_dir() {
-        copy_dir(p, &target).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(p).map_err(friendly_io)?;
+    if meta.file_type().is_symlink() {
+        // A copy of a link is another link, not a copy of what it points at.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(fs::read_link(p).map_err(friendly_io)?, &target)
+            .map_err(friendly_io)?;
+    } else if meta.is_dir() {
+        if let Err(e) = copy_dir(p, &target) {
+            let _ = fs::remove_dir_all(&target); // no half-copied tree left behind
+            return Err(friendly_io(e));
+        }
     } else {
-        fs::copy(p, &target).map_err(|e| e.to_string())?;
+        fs::copy(p, &target).map_err(friendly_io)?;
     }
     Ok(target.to_string_lossy().into_owned())
 }
@@ -793,12 +1036,21 @@ async fn duplicate_path(path: String) -> Result<String, String> {
 /// Move a file/folder to the OS Trash (recoverable) rather than deleting it.
 #[tauri::command]
 async fn trash_path(path: String) -> Result<(), String> {
-    trash::delete(&path).map_err(|e| e.to_string())
+    scope().check_root(&path)?;
+    trash::delete(&path).map_err(|_| {
+        // trash::Error's Display is a Debug dump — not for users' eyes.
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        format!("“{name}” couldn’t be moved to the Trash — this volume may not have one.")
+    })
 }
 
 /// Show the item in Finder / Explorer / the desktop file manager.
 #[tauri::command]
 async fn reveal_path(path: String) -> Result<(), String> {
+    scope().check(&path)?;
     tauri_plugin_opener::reveal_item_in_dir(&path).map_err(|e| e.to_string())
 }
 
@@ -806,6 +1058,7 @@ async fn reveal_path(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
+    scope().check(&path)?;
     app.opener()
         .open_path(path, None::<&str>)
         .map_err(|e| e.to_string())
@@ -839,6 +1092,7 @@ fn walker(root: &str) -> ignore::WalkBuilder {
 /// Recursively list every markdown/image file under `root` (for Quick Open).
 #[tauri::command]
 async fn list_all(root: String) -> Result<Vec<FileHit>, String> {
+    scope().check_root(&root)?;
     let root_p = Path::new(&root);
     let mut out = Vec::new();
     for entry in walker(&root).build().flatten() {
@@ -885,6 +1139,7 @@ async fn search_files(
     case_sensitive: bool,
     whole_word: bool,
 ) -> Result<SearchResult, String> {
+    scope().check_root(&root)?;
     if query.trim().is_empty() {
         return Ok(SearchResult {
             hits: vec![],
@@ -965,18 +1220,22 @@ async fn search_files(
             }
             if !local.is_empty() {
                 count.fetch_add(local.len(), Ordering::Relaxed);
-                hits.lock().unwrap().extend(local);
+                hits.lock().unwrap_or_else(|e| e.into_inner()).extend(local);
             }
             WalkState::Continue
         })
     });
 
-    let mut out = Arc::try_unwrap(hits)
-        .map(|m| m.into_inner().unwrap())
-        .unwrap_or_default();
+    // Never unwrap_or_default here: losing the Arc race would silently report
+    // "no results" for a query that had plenty.
+    let mut out = match Arc::try_unwrap(hits) {
+        Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(a) => std::mem::take(&mut *a.lock().unwrap_or_else(|e| e.into_inner())),
+    };
     // Parallel results arrive unordered — group by file, then line.
     out.sort_by(|a, b| a.rel.cmp(&b.rel).then(a.line.cmp(&b.line)));
-    let truncated = out.len() > MAX_HITS;
+    // Workers quit *at* the cap, so exactly-MAX_HITS results are partial too.
+    let truncated = out.len() >= MAX_HITS;
     out.truncate(MAX_HITS);
     Ok(SearchResult {
         hits: out,
@@ -1155,19 +1414,29 @@ fn drop_marks_that_lead_nowhere(entries: &mut Vec<GitEntry>) {
 }
 
 fn git_output_lenient(dir: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
+    let out = git_command(dir, args).output().ok()?;
+    // Lossy: one non-UTF-8 byte anywhere must not blank the whole answer.
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Every git invocation goes through here so the env is consistent.
+fn git_command(dir: &str, args: &[&str]) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir)
         .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    String::from_utf8(out.stdout).ok()
+        // Paths this app passes are literal file names, never patterns —
+        // without this, discarding "[draft] plan.md" globs, matches nothing
+        // in HEAD, and the file is trashed instead of restored.
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(std::process::Stdio::null());
+    cmd
 }
 
 /// Unified diff for one file against the last commit, staged changes included.
 /// A file that was never committed is rendered wholly added.
 #[tauri::command]
 async fn git_diff(path: String) -> Option<String> {
+    scope().check(&path).ok()?;
     let p = Path::new(&path);
     let dir = p.parent()?.to_string_lossy().into_owned();
     // Confirm we're in a repository first, or an untracked file outside one
@@ -1219,6 +1488,7 @@ fn git_in_head(dir: &str, path: &str) -> bool {
 /// someone's new document is not an acceptable reading of "discard".
 #[tauri::command]
 async fn git_discard(path: String) -> Result<String, String> {
+    scope().check(&path)?;
     let p = Path::new(&path);
     let dir = p
         .parent()
@@ -1233,22 +1503,46 @@ async fn git_discard(path: String) -> Result<String, String> {
         Ok("restored".into())
     } else {
         let _ = git_output(&dir, &["restore", "--staged", "--", &path]); // unstage if added
-        trash::delete(&path).map_err(|e| e.to_string())?;
+        trash::delete(&path).map_err(|_| {
+            format!(
+                "“{}” couldn’t be moved to the Trash — this volume may not have one.",
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone())
+            )
+        })?;
         Ok("trashed".into())
     }
 }
 
+/// What `git_discard` would do to `path`: `"restore"` (committed — goes back
+/// to HEAD) or `"trash"` (nothing to go back to). The UI words its
+/// confirmation from this rather than guessing from the status letter — a
+/// renamed file's letter says "committed" but its *new* path is not in HEAD,
+/// and a dialog promising a restore must not deliver a trashing.
+#[tauri::command]
+async fn git_discard_kind(path: String) -> Result<String, String> {
+    scope().check(&path)?;
+    let dir = Path::new(&path)
+        .parent()
+        .ok_or("Invalid path")?
+        .to_string_lossy()
+        .into_owned();
+    Ok(if git_in_head(&dir, &path) {
+        "restore".into()
+    } else {
+        "trash".into()
+    })
+}
+
 fn git_output(dir: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let out = git_command(dir, args).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok()
+    // Lossy: a single Latin-1 filename in the porcelain stream must not erase
+    // every badge in the sidebar.
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pending git changes under `root`, or None when it isn't a repository (or git
@@ -1256,6 +1550,7 @@ fn git_output(dir: &str, args: &[&str]) -> Option<String> {
 /// on a change event, not in a hot loop.
 #[tauri::command]
 async fn git_status(root: String) -> Option<GitInfo> {
+    scope().check_root(&root).ok()?;
     let repo = git_output(&root, &["rev-parse", "--show-toplevel"])?
         .trim()
         .to_string();
@@ -1307,10 +1602,11 @@ struct FsChange {
 /// and the open document stay in step with edits made outside the app.
 #[tauri::command]
 fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    scope().check_root(&path)?;
     let state = app.state::<FsWatcher>();
     // Drop the previous watcher first; that closes its channel and ends the
     // debounce thread below.
-    *state.0.lock().unwrap() = None;
+    *state.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |res| {
@@ -1320,7 +1616,7 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
     watcher
         .watch(Path::new(&path), notify::RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
-    *state.0.lock().unwrap() = Some(watcher);
+    *state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
 
     let handle = app.clone();
     let root = PathBuf::from(&path);
@@ -1401,9 +1697,27 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
 
 // -------------------------------------------------------------- quit flow
 
-/// Set true by the frontend to abort a pending ⌘Q (e.g. the user chose to keep
-/// an unsaved draft), so the exit backstop thread does not force-quit.
-struct ExitAborted(Arc<AtomicBool>);
+/// One quit attempt in flight. `acked` records that the webview received the
+/// flush-and-exit event and now owns the flow; `generation` invalidates the
+/// backstop of a superseded attempt.
+struct ExitFlow(Arc<ExitFlowState>);
+
+#[derive(Default)]
+struct ExitFlowState {
+    acked: AtomicBool,
+    generation: AtomicUsize,
+}
+
+/// Should the exit backstop force-quit? Only when its own attempt is still
+/// current and the webview never acknowledged it. There is deliberately no
+/// wall-clock cap after an ack: the flush may legitimately sit on a native
+/// dialog (unsaved draft, save conflict) for as long as the user ponders it,
+/// and a timer racing that dialog is how work gets destroyed. A webview that
+/// acks and then dies is recovered by the *next* quit attempt — a fresh
+/// generation it can no longer ack.
+fn backstop_fires(spawned_gen: usize, current_gen: usize, acked: bool) -> bool {
+    spawned_gen == current_gen && !acked
+}
 
 /// Called by the frontend once pending edits are flushed; exits for real.
 #[tauri::command]
@@ -1411,10 +1725,11 @@ fn confirm_exit(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// Cancel a pending ⌘Q — the user declined to quit (unsaved draft kept).
+/// First thing the frontend calls on `flush-and-exit`: proves the webview is
+/// alive, which disarms the force-quit backstop for this attempt.
 #[tauri::command]
-fn cancel_exit(state: tauri::State<ExitAborted>) {
-    state.0.store(true, Ordering::SeqCst);
+fn exit_ack(state: tauri::State<ExitFlow>) {
+    state.0.acked.store(true, Ordering::SeqCst);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1427,14 +1742,20 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            app.manage(Recents(Mutex::new(load_recents(&handle))));
+            let recents = load_recents(&handle);
+            // Recents seed the scope: every entry was dialog-granted when it
+            // was first opened, and push_recent refuses anything that wasn't.
+            for r in &recents {
+                scope().grant_root(r);
+            }
+            app.manage(Recents(Mutex::new(recents)));
             app.manage(MenuState {
                 save: Mutex::new(None),
                 save_as: Mutex::new(None),
                 enabled: Mutex::new((false, false)),
             });
             app.manage(FsWatcher(Mutex::new(None)));
-            app.manage(ExitAborted(Arc::new(AtomicBool::new(false))));
+            app.manage(ExitFlow(Arc::new(ExitFlowState::default())));
             rebuild_menu(&handle)?;
             Ok(())
         })
@@ -1478,7 +1799,7 @@ pub fn run() {
                 }
                 "clear_recents" => {
                     if let Some(state) = app.try_state::<Recents>() {
-                        state.0.lock().unwrap().clear();
+                        state.0.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     }
                     save_recents(app, &[]);
                     let _ = rebuild_menu(app);
@@ -1518,29 +1839,33 @@ pub fn run() {
             git_status,
             git_diff,
             git_discard,
+            git_discard_kind,
             watch_folder,
             confirm_exit,
-            cancel_exit
+            exit_ack
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // User-initiated quit (⌘Q): hold the exit once so the frontend can
-            // flush edits and warn about an unsaved draft. It then calls either
-            // confirm_exit (proceed) or cancel_exit (abort — keep the draft).
+            // User-initiated quit (⌘Q): hold the exit so the frontend can
+            // flush edits and warn about an unsaved draft. It acks receipt
+            // immediately (exit_ack), then calls confirm_exit to proceed — or
+            // simply stands down to stay. confirm_exit's app.exit(0) re-enters
+            // here with code Some(0) and falls straight through.
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 if code.is_none() {
                     api.prevent_exit();
-                    let aborted = app.state::<ExitAborted>().0.clone();
-                    aborted.store(false, Ordering::SeqCst);
+                    let st = app.state::<ExitFlow>().0.clone();
+                    let gen = st.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    st.acked.store(false, Ordering::SeqCst);
                     let _ = app.emit("flush-and-exit", ());
-                    // Backstop: force-quit only if the webview never answers —
-                    // long enough for the user to respond to a save prompt, and
-                    // skipped entirely if they chose to stay.
+                    // Backstop for a webview that never answers at all (dead,
+                    // hung, or not yet loaded — no user edits can exist then).
                     let handle = app.clone();
                     std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(20));
-                        if !aborted.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_secs(5));
+                        let current = st.generation.load(Ordering::SeqCst);
+                        if backstop_fires(gen, current, st.acked.load(Ordering::SeqCst)) {
                             handle.exit(0);
                         }
                     });
@@ -1578,6 +1903,9 @@ mod tests {
             let p = std::env::temp_dir().join(format!("mad-test-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(&p).unwrap();
+            // Grant the directory so every test runs through the real scope
+            // checks — exactly as a dialog-granted workspace would.
+            scope().grant_root(&p.to_string_lossy());
             TempDir(p)
         }
         fn path(&self) -> &Path {
@@ -2025,7 +2353,7 @@ mod tests {
         let t = TempDir::new();
         let p = t.write("f.md", "body\n");
         let data = run(read_file(p.clone())).unwrap();
-        assert_eq!(run(file_stamp(p)), data.stamp);
+        assert_eq!(run(file_stamp(p)), Ok(data.stamp));
     }
 
     #[test]
@@ -2559,5 +2887,239 @@ mod tests {
             Path::new("/Users/x/.notes/sub/today.md")
         ));
         assert!(in_skipped_dir(root, Path::new("/Users/x/.notes/.git/HEAD")));
+    }
+
+    // --------------------------------------------------------------- scope
+
+    /// A path in the system temp dir that no test ever granted. Parallel tests
+    /// each grant their own TempDir subdirectory, never temp_dir() itself.
+    fn denied(rel: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("mad-denied-{rel}"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn commands_refuse_paths_outside_every_granted_root() {
+        fs::create_dir_all(denied("dir")).unwrap();
+        fs::write(denied("dir/secret.md"), "s").unwrap();
+
+        let err = run(write_file(denied("dir/secret.md"), "x".into(), None)).unwrap_err();
+        assert!(err.contains("outside the open workspace"), "{err}");
+        assert_eq!(fs::read_to_string(denied("dir/secret.md")).unwrap(), "s");
+
+        assert!(run(read_file(denied("dir/secret.md"))).is_err());
+        assert!(run(list_dir(denied("dir"))).is_err());
+        assert!(run(trash_path(denied("dir/secret.md"))).is_err());
+        assert!(run(duplicate_path(denied("dir/secret.md"))).is_err());
+        assert!(run(create_file(denied("dir"), "a.md".into())).is_err());
+        assert!(run(list_all(denied("dir"))).is_err());
+
+        let _ = fs::remove_dir_all(denied("dir"));
+    }
+
+    #[test]
+    fn a_granted_file_may_be_read_and_written_but_not_trashed() {
+        // The file tier models Save As outside the workspace: the document
+        // stays editable, but tree operations never extend to it.
+        fs::create_dir_all(denied("grant")).unwrap();
+        let file = denied("grant/exported.md");
+        fs::write(&file, "v1").unwrap();
+        scope().grant_file(&file);
+
+        run(write_file(file.clone(), "v2".into(), None)).unwrap();
+        assert_eq!(run(read_file(file.clone())).unwrap().content, "v2");
+        assert!(run(file_stamp(file.clone())).is_ok());
+        // …but its siblings gain nothing, and destructive ops stay refused.
+        assert!(run(read_file(denied("grant/exported 2.md"))).is_err());
+        assert!(run(trash_path(file.clone())).is_err());
+
+        let _ = fs::remove_dir_all(denied("grant"));
+    }
+
+    #[test]
+    fn scope_roots_do_not_leak_to_prefix_sibling_directories() {
+        // /ws must not admit /ws2 — starts_with is component-wise.
+        let t = TempDir::new();
+        fs::create_dir_all(t.path().join("ws")).unwrap();
+        scope().grant_root(&t.s("ws"));
+        let sibling = format!("{}2", t.s("ws"));
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(format!("{sibling}/a.md"), "a").unwrap();
+        // The sibling is still inside the TempDir (granted), so probe the
+        // component logic directly.
+        let c = canonical_target(&format!("{sibling}/a.md")).unwrap();
+        let ws = canonical_target(&t.s("ws")).unwrap();
+        assert!(!c.starts_with(&ws));
+    }
+
+    #[test]
+    fn canonical_target_resolves_new_files_and_rejects_traversal() {
+        let t = TempDir::new();
+        // A file that doesn't exist yet resolves through its parent.
+        let fresh = canonical_target(&t.s("new.md")).unwrap();
+        assert_eq!(fresh.file_name().unwrap(), "new.md");
+        // A missing parent cannot resolve at all.
+        assert!(canonical_target(&t.s("no-such-dir/new.md")).is_err());
+        // `..` never sneaks through, even when the result would land inside.
+        let dodgy = format!("{}/sub/../new.md", t.s(""));
+        assert!(canonical_target(&dodgy).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_out_of_the_workspace_is_outside_it() {
+        let t = TempDir::new();
+        fs::create_dir_all(denied("target")).unwrap();
+        fs::write(denied("target/real.md"), "outside").unwrap();
+        std::os::unix::fs::symlink(denied("target/real.md"), t.path().join("link.md")).unwrap();
+        // The link sits inside a granted root, but it resolves outside — and
+        // membership is decided on the resolved path.
+        let err = run(read_file(t.s("link.md"))).unwrap_err();
+        assert!(err.contains("outside the open workspace"), "{err}");
+        let _ = fs::remove_dir_all(denied("target"));
+    }
+
+    // ----------------------------------------------------------- exit flow
+
+    #[test]
+    fn the_exit_backstop_only_fires_for_a_silent_current_attempt() {
+        // Webview never answered: force-quit is correct.
+        assert!(backstop_fires(1, 1, false));
+        // Webview acked: it owns the flow now, no wall clock may cut it short.
+        assert!(!backstop_fires(1, 1, true));
+        // A newer quit attempt superseded this backstop: stand down.
+        assert!(!backstop_fires(1, 2, false));
+    }
+
+    // -------------------------------------------------- write-path hardening
+
+    #[test]
+    fn concurrent_saves_never_publish_a_torn_file() {
+        // Two writers hammering one path: with a shared temp name one rename
+        // can publish the other's half-written bytes. Unique temp names make
+        // every observable content a complete write from one side.
+        let t = TempDir::new();
+        let path = t.s("note.md");
+        run(write_file(path.clone(), "seed".into(), None)).unwrap();
+        let a_body = "A".repeat(64 * 1024);
+        let b_body = "B".repeat(64 * 1024);
+        let spawn = |body: String, path: String| {
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _ = run(write_file(path.clone(), body.clone(), None));
+                }
+            })
+        };
+        let a = spawn(a_body.clone(), path.clone());
+        let b = spawn(b_body.clone(), path.clone());
+        a.join().unwrap();
+        b.join().unwrap();
+        let final_content = fs::read_to_string(&path).unwrap();
+        assert!(
+            final_content == a_body || final_content == b_body,
+            "file holds a torn mix of both writers"
+        );
+        assert_eq!(names(t.path()), vec!["note.md"], "no stray temp files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let t = TempDir::new();
+        let real = t.write("real.md", "old");
+        std::os::unix::fs::symlink(&real, t.path().join("link.md")).unwrap();
+
+        run(write_file(t.s("link.md"), "new".into(), None)).unwrap();
+
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+        let meta = fs::symlink_metadata(t.path().join("link.md")).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "the link was replaced by a regular file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicating_a_folder_with_symlinks_copies_links_as_links() {
+        let t = TempDir::new();
+        fs::create_dir_all(t.path().join("folder")).unwrap();
+        t.write("folder/a.md", "a");
+        std::os::unix::fs::symlink(t.path().join("folder/a.md"), t.path().join("folder/ln.md"))
+            .unwrap();
+
+        let copy = run(duplicate_path(t.s("folder"))).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(Path::new(&copy).join("a.md")).unwrap(),
+            "a"
+        );
+        let meta = fs::symlink_metadata(Path::new(&copy).join("ln.md")).unwrap();
+        assert!(meta.file_type().is_symlink());
+    }
+
+    // -------------------------------------------------- git path literalness
+
+    #[test]
+    fn discard_restores_a_committed_file_whose_name_is_a_glob_pattern() {
+        // "[draft] plan.md": as a git pathspec, [draft] is a character class
+        // that matches nothing in HEAD — so without literal pathspecs the file
+        // reads as never-committed and "discard" trashes the whole document.
+        let t = TempDir::new();
+        let sh = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(t.path())
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        sh(&["init", "--quiet", "-b", "main"]);
+        sh(&["config", "user.email", "t@example.com"]);
+        sh(&["config", "user.name", "t"]);
+        let path = t.write("[draft] plan.md", "committed\n");
+        sh(&["add", "-A"]);
+        sh(&["commit", "--quiet", "-m", "init"]);
+        fs::write(&path, "edited\n").unwrap();
+
+        assert_eq!(run(git_discard_kind(path.clone())), Ok("restore".into()));
+        assert_eq!(run(git_discard(path.clone())), Ok("restored".into()));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "committed\n");
+    }
+
+    #[test]
+    fn discard_kind_tells_the_truth_about_a_renamed_file() {
+        // The porcelain letter says "renamed" (looks committed), but the new
+        // path is not in HEAD — discard will trash it, and the UI must be able
+        // to say so before the user agrees.
+        let t = TempDir::new();
+        let sh = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(t.path())
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        };
+        sh(&["init", "--quiet", "-b", "main"]);
+        sh(&["config", "user.email", "t@example.com"]);
+        sh(&["config", "user.name", "t"]);
+        let old = t.write("old.md", "body\n");
+        sh(&["add", "-A"]);
+        sh(&["commit", "--quiet", "-m", "init"]);
+        sh(&["mv", "old.md", "new.md"]);
+
+        assert_eq!(run(git_discard_kind(t.s("new.md"))), Ok("trash".into()));
+        assert_eq!(run(git_discard_kind(old)), Ok("restore".into()));
     }
 }

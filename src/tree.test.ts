@@ -327,11 +327,18 @@ describe("keyboard navigation", () => {
     expect(container.querySelector(".rename-input")).toBeTruthy();
   });
 
-  it("asks to delete on Backspace and Delete", () => {
+  it("asks to delete only on ⌘⌫ — a bare Backspace is a mistyped edit", () => {
     row("/w/README.md").focus();
     key("Backspace");
-    expect(cb.onDelete).toHaveBeenCalledWith("/w/README.md", false);
     key("Delete");
+    expect(cb.onDelete).not.toHaveBeenCalled();
+    container.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Backspace", metaKey: true, bubbles: true }),
+    );
+    expect(cb.onDelete).toHaveBeenCalledWith("/w/README.md", false);
+    container.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Delete", ctrlKey: true, bubbles: true }),
+    );
     expect(cb.onDelete).toHaveBeenCalledTimes(2);
   });
 

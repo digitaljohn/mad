@@ -69,11 +69,14 @@ export function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Escape for interpolation into HTML text. */
+/** Escape for interpolation into HTML — text *or* attribute context. */
 export function escapeHtml(s: string): string {
   return s.replace(
-    /[&<>]/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!,
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        c
+      ]!,
   );
 }
 

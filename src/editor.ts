@@ -164,6 +164,8 @@ export class MarkdownEditor {
   private currentPath: string | null = null;
   /** Content (of the active surface) as of the last successful save/open. */
   private lastSaved = "";
+  /** On-disk stamp we've already warned about (see doCheckExternal). */
+  private warnedStamp: string | null = null;
   /** On-disk change stamp for currentPath, used to detect external edits. */
   private stamp = "";
   private dirty = false;
@@ -395,10 +397,15 @@ export class MarkdownEditor {
     if (data.stamp === this.stamp) return;
     if (this.content() !== this.lastSaved) {
       // Don't throw away the user's edits; the save will offer a choice.
-      toast("This file also changed on disk — saving will ask what to keep.", {
-        kind: "error",
-        duration: 7000,
-      });
+      // Warn once per on-disk version — a sync client or build watcher can
+      // fire events for minutes, and a wall of identical toasts helps nobody.
+      if (this.warnedStamp !== data.stamp) {
+        this.warnedStamp = data.stamp;
+        toast("This file also changed on disk — saving will ask what to keep.", {
+          kind: "error",
+          duration: 7000,
+        });
+      }
       return;
     }
     this.applyContent(data.content);
@@ -677,6 +684,7 @@ export class MarkdownEditor {
     const { content: markdown, stamp } = await this.backend.readFile(path);
     this.currentPath = path;
     this.stamp = stamp;
+    this.warnedStamp = null;
     if (!this.crepe) {
       await this.mount(this._mode === "rich" || this.split ? markdown : "");
     } else if (this._mode === "rich" || this.split) {

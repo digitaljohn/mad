@@ -193,6 +193,9 @@ export class CommandPalette {
   private onKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.preventDefault();
+      // The window handler also acts on Escape (find bar, diff panel) —
+      // closing a modal must not close things behind it too.
+      e.stopPropagation();
       this.close();
     } else if (e.key === "ArrowDown") {
       e.preventDefault();

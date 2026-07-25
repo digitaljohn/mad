@@ -47,6 +47,7 @@ export async function checkForUpdates(
   if (inFlight) return;
   inFlight = true;
   let checking: ToastHandle | null = null;
+  let progress: ToastHandle | null = null;
   try {
     if (!silent) checking = toast("Checking for updates…", { duration: 0 });
 
@@ -72,7 +73,7 @@ export async function checkForUpdates(
     );
     if (!ok) return;
 
-    const progress = toast(progressLine(0, null), { duration: 0 });
+    progress = toast(progressLine(0, null), { duration: 0 });
     let downloaded = 0;
     let total: number | null = null;
 
@@ -81,20 +82,23 @@ export async function checkForUpdates(
         total = event.data.contentLength ?? null;
       } else if (event.event === "Progress") {
         downloaded += event.data.chunkLength;
-        progress.setText(progressLine(downloaded, total));
+        progress?.setText(progressLine(downloaded, total));
       } else if (event.event === "Finished") {
-        progress.setText("Installing update…");
+        progress?.setText("Installing update…");
       }
     });
 
-    progress.setText("Restarting…");
+    progress?.setText("Restarting…");
     const { relaunch } = await import("@tauri-apps/plugin-process");
     await relaunch();
   } catch (e) {
     checking?.dismiss();
+    // A failed download must not leave "Downloading update…" up forever.
+    progress?.dismiss();
     // A silent check must stay silent: no network, a rate limit or an
     // unpublished manifest are all normal and none are the user's problem.
-    if (!silent) toastError("Couldn’t check for updates", e);
+    // A failed *download* is different — the user chose it, so tell them.
+    if (!silent || progress) toastError("Couldn’t update", e);
   } finally {
     inFlight = false;
   }

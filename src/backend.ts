@@ -128,6 +128,9 @@ export interface Backend {
   gitDiff(path: string): Promise<string | null>;
   /** Throw away a file's changes. Resolves "restored" or "trashed". */
   gitDiscard(path: string): Promise<string>;
+  /** What gitDiscard would do: "restore" (back to HEAD) or "trash" (nothing
+      committed to go back to). Lets the UI promise only what will happen. */
+  gitDiscardKind(path: string): Promise<string>;
   /** Start watching `root` for external changes (emits `fs-change`). */
   watchFolder(root: string): Promise<void>;
 }
@@ -196,6 +199,7 @@ async function tauriBackend(): Promise<Backend> {
     gitStatus: (root) => invoke<GitInfo | null>("git_status", { root }),
     gitDiff: (path) => invoke<string | null>("git_diff", { path }),
     gitDiscard: (path) => invoke<string>("git_discard", { path }),
+    gitDiscardKind: (path) => invoke<string>("git_discard_kind", { path }),
     watchFolder: (root) => invoke<void>("watch_folder", { path: root }),
   };
 }
@@ -424,6 +428,9 @@ function mockBackend(): Backend {
       touch(path);
       return "restored";
     },
+    // Mirrors the mock gitStatus: only README.md is "in HEAD".
+    gitDiscardKind: async (path) =>
+      path.endsWith("README.md") ? "restore" : "trash",
     watchFolder: async () => {},
   };
 
