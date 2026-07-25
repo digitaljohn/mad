@@ -136,8 +136,10 @@ describe("escaping", () => {
     expect(re.test("axbbc")).toBe(false);
   });
 
-  it("escapes the three characters that break HTML text", () => {
-    expect(escapeHtml('<b>&"')).toBe('&lt;b&gt;&amp;"');
+  it("escapes everything that breaks HTML text or attributes", () => {
+    // Quotes matter too: a filename containing " must survive a future move
+    // of this output into an attribute context.
+    expect(escapeHtml("<b>&\"'")).toBe("&lt;b&gt;&amp;&quot;&#39;");
   });
 });
 

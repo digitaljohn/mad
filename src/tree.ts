@@ -9,7 +9,7 @@ const FOLDER_ICON = `<svg class="row-icon" width="14" height="14" viewBox="0 0 1
 const MD_ICON = `<svg class="row-icon md" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3.25" width="14" height="9.5" rx="2"/><path d="M3.5 10.25v-4.5l1.9 2.2 1.9-2.2v4.5"/><path d="M11.6 5.75v4.5m-1.7-1.8 1.7 1.8 1.7-1.8"/></svg>`;
 const IMG_ICON = `<svg class="row-icon img" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="2"/><circle cx="5.9" cy="6.4" r="1.15"/><path d="M2.5 11.6 6 8.25l2.4 2.35 2.1-2.1 3 3"/></svg>`;
 
-import { IMG_RE, MD_RE, baseOf, parentOf } from "./paths";
+import { IMG_RE, MD_RE, baseOf, isUnder, parentOf } from "./paths";
 
 /** Single-letter badge per git state, and which one wins on a folder. */
 const GIT_BADGE: Record<GitStatus, string> = {
@@ -188,7 +188,7 @@ export class FileTree {
 
   async setRoot(path: string, expanded: string[] = []) {
     this.root = path;
-    this.expanded = new Set(expanded.filter((p) => p.startsWith(path)));
+    this.expanded = new Set(expanded.filter((p) => isUnder(p, path)));
     this.children.clear();
     this.selected = null;
     this.focusPath = null;
@@ -215,7 +215,7 @@ export class FileTree {
       // Propagate up to (but not past) the workspace root.
       const stop = this.root;
       let dir = parentOf(e.path);
-      while (dir && (!stop || dir.startsWith(stop))) {
+      while (dir && (!stop || isUnder(dir, stop))) {
         const cur = this.gitDirs.get(dir);
         if (!cur || GIT_RANK[e.status] > GIT_RANK[cur]) this.gitDirs.set(dir, e.status);
         if (dir === stop) break;
@@ -255,7 +255,7 @@ export class FileTree {
 
   /** Expand every ancestor of `path`, load them, and select it. */
   async reveal(path: string) {
-    if (!this.root || !path.startsWith(this.root)) return;
+    if (!this.root || !isUnder(path, this.root)) return;
     const parts = path.slice(this.root.length).split("/").filter(Boolean);
     let cur = this.root;
     let changed = false;
@@ -528,6 +528,10 @@ export class FileTree {
       case "Backspace":
       case "Delete":
         if (!row) break;
+        // ⌘⌫ only (the Finder convention). A bare Backspace is far too often
+        // a mistyped edit to answer with a "move to Trash?" dialog — and on a
+        // folder row it would offer to trash a whole subtree.
+        if (!e.metaKey && !e.ctrlKey) break;
         e.preventDefault();
         this.cb.onDelete(row.path, row.isDir);
         break;

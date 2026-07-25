@@ -163,17 +163,14 @@ describe("usableTabs", () => {
     expect(usableTabs(["/w/a.md", "/w/deleted.md"], "/w", known)).toEqual(["/w/a.md"]);
   });
 
-  it("keeps tabs outside the workspace on trust, since the index misses them", () => {
-    expect(usableTabs(["/elsewhere/notes.md"], "/w", known)).toEqual([
-      "/elsewhere/notes.md",
-    ]);
+  it("drops tabs outside the workspace — their dialog grant died with the session", () => {
+    // Restoring one would open a document the scoped backend refuses to save.
+    expect(usableTabs(["/elsewhere/notes.md"], "/w", known)).toEqual([]);
   });
 
   it("does not treat a sibling directory as inside the workspace", () => {
     // "/workspace-old/x.md" starts with "/w" but is not under "/w".
-    expect(usableTabs(["/workspace-old/x.md"], "/w", known)).toEqual([
-      "/workspace-old/x.md",
-    ]);
+    expect(usableTabs(["/workspace-old/x.md"], "/w", known)).toEqual([]);
   });
 
   it("returns nothing for an empty list", () => {

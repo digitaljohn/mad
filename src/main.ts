@@ -27,6 +27,7 @@ import {
   type Session,
 } from "./session";
 import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
+import { resolveKey } from "./keys";
 import { CommandPalette, ICON_COMMAND, ICON_HEADING } from "./palette";
 import { toast, toastError } from "./toast";
 import { checkForUpdates } from "./updater";
@@ -77,20 +78,21 @@ async function init() {
   // ------------------------------------------------------------- session
 
   let sessionTimer: ReturnType<typeof setTimeout> | undefined;
+  const buildSession = (): Session => ({
+    root: rootPath,
+    tabs: tabs.filter((t) => !t.draft).map((t) => t.path),
+    active: activePath === DRAFT ? null : activePath,
+    expanded: tree.expandedDirs,
+    sidebarHidden: document.body.classList.contains("sidebar-hidden"),
+    scale: docScale,
+    sidebarWidth: sidebar.style.width || null,
+  });
   const saveSession = () => {
     clearTimeout(sessionTimer);
-    sessionTimer = setTimeout(() => {
-      const session: Session = {
-        root: rootPath,
-        tabs: tabs.filter((t) => !t.draft).map((t) => t.path),
-        active: activePath === DRAFT ? null : activePath,
-        expanded: tree.expandedDirs,
-        sidebarHidden: document.body.classList.contains("sidebar-hidden"),
-        scale: docScale,
-        sidebarWidth: sidebar.style.width || null,
-      };
-      persistSession(localStorage, session);
-    }, 250);
+    sessionTimer = setTimeout(
+      () => persistSession(localStorage, buildSession()),
+      250,
+    );
   };
 
   const setSaveState = (state: SaveState) => {
@@ -348,6 +350,13 @@ async function init() {
     welcome.classList.toggle("hidden", which !== "welcome");
     editorEl.classList.toggle("hidden", !isEditor);
     imageViewer.classList.toggle("hidden", which !== "image");
+    if (which !== "image") {
+      // Release the (possibly multi-MB) data URL instead of holding it for
+      // the rest of the session.
+      imageViewerImg.onload = null;
+      imageViewerImg.onerror = null;
+      imageViewerImg.removeAttribute("src");
+    }
     modeToggle.classList.toggle("hidden", !isEditor || editor.isSplit);
     $("btn-split").classList.toggle("hidden", !isEditor);
     if (!isEditor) saveStatus.classList.add("hidden");
@@ -355,15 +364,21 @@ async function init() {
     closeDiff();
   };
 
-  /** Make `path` the active view (its tab must already exist). */
-  const activate = async (path: string) => {
+  /** Monotonic ticket for activations: slow async work (an image decode, a
+      file read) must never overwrite the state of a newer activation. */
+  let activateSeq = 0;
+
+  /** Make `path` the active view (its tab must already exist).
+      Resolves true when the tab actually became active. */
+  const activate = async (path: string): Promise<boolean> => {
     const tab = tabs.find((t) => t.path === path);
-    if (!tab) return;
+    if (!tab) return false;
+    const seq = ++activateSeq;
 
     // Re-activating the already-visible tab: just show it.
     if (activePath === path && (tab.draft || tab.kind === "img" || editor.path === path)) {
       showSurface(tab.kind === "img" ? "image" : "editor");
-      return;
+      return true;
     }
 
     // Preserve the unsaved draft's content before we leave it.
@@ -372,8 +387,9 @@ async function init() {
     if (tab.draft) {
       if (!(await editor.openDraft(draftBuffer))) {
         tree.select(editor.path);
-        return;
+        return false;
       }
+      if (seq !== activateSeq) return false; // superseded while loading
       activePath = DRAFT;
       showSurface("editor");
       tree.select(null);
@@ -381,23 +397,31 @@ async function init() {
       updateMenuState();
       updateStatus();
       saveSession();
-      return;
+      return true;
     }
 
     if (tab.kind === "img") {
       await editor.flush();
+      let url: string;
       try {
-        const url = await backend.toDisplayUrl(path);
-        imageMeta.textContent = baseOf(path);
-        imageViewerImg.onload = () => {
-          imageMeta.textContent = `${baseOf(path)} · ${imageViewerImg.naturalWidth}×${imageViewerImg.naturalHeight}`;
-        };
-        imageViewerImg.src = url;
+        url = await backend.toDisplayUrl(path);
       } catch (e) {
         toastError("Couldn’t open image", e);
         await closeTab(path);
-        return;
+        return false;
       }
+      if (seq !== activateSeq) return false; // a newer activation won
+      imageMeta.textContent = baseOf(path);
+      imageViewerImg.onload = () => {
+        imageMeta.textContent = `${baseOf(path)} · ${imageViewerImg.naturalWidth}×${imageViewerImg.naturalHeight}`;
+      };
+      imageViewerImg.onerror = () => {
+        imageMeta.textContent = `${baseOf(path)} — couldn’t be displayed`;
+        toast(`“${baseOf(path)}” doesn’t look like a valid image.`, {
+          kind: "error",
+        });
+      };
+      imageViewerImg.src = url;
       activePath = path;
       showSurface("image");
       tree.select(path);
@@ -405,19 +429,20 @@ async function init() {
       updateMenuState();
       updateStatus();
       saveSession();
-      return;
+      return true;
     }
 
     try {
       if (!(await editor.openFile(path))) {
         tree.select(editor.path); // save blocked — stay on the current file
-        return;
+        return false;
       }
     } catch (e) {
       toastError(`Couldn’t open ${baseOf(path)}`, e);
       await closeTab(path);
-      return;
+      return false;
     }
+    if (seq !== activateSeq) return false; // superseded while loading
     activePath = path;
     showSurface("editor");
     tree.select(path);
@@ -425,23 +450,32 @@ async function init() {
     updateMenuState();
     updateStatus();
     saveSession();
+    return true;
   };
 
   /** Open a file: create its tab if needed, then activate it. */
-  const openFile = async (path: string) => {
+  const openFile = async (path: string): Promise<boolean> => {
     if (!tabs.some((t) => t.path === path)) {
       tabs.push({ path, kind: IMG_RE.test(path) ? "img" : "md" });
     }
-    await activate(path);
+    return activate(path);
   };
 
   const goWelcome = () => {
     activePath = null;
+    // Nothing is shown, so nothing may keep reacting to fs events or flushes.
+    editor.detach();
     showSurface("welcome");
     tree.select(null);
     updateMenuState();
     updateStatus();
     saveSession();
+  };
+
+  /** After a flush, is the buffer safely on disk (or nothing left to save)? */
+  const ensureSaved = async (): Promise<boolean> => {
+    await editor.flush(); // reports its own errors
+    return !editor.path || !editor.hasUnsavedChanges;
   };
 
   const closeTab = async (path: string) => {
@@ -462,24 +496,58 @@ async function init() {
       draftBuffer = "";
       if (activePath === DRAFT) editor.detach();
     }
-    const wasActive = activePath === path;
-    tabs.splice(idx, 1);
-    if (!wasActive) {
+    if (activePath !== path) {
+      tabs.splice(idx, 1);
       renderTabs();
       saveSession();
       return;
     }
+    // The active document must be safely on disk before its tab disappears —
+    // a failed save keeps the tab (and with it the retry path) alive.
+    if (tab.kind === "md" && !tab.draft && !(await ensureSaved())) return;
+    if (editor.path === path) editor.detach();
+    tabs.splice(idx, 1);
     if (tabs.length === 0) {
-      await editor.flush();
       goWelcome();
       renderTabs();
       return;
     }
     await activate(tabs[Math.min(idx, tabs.length - 1)].path);
+    if (activePath === path) {
+      // The neighbour failed to open (its tab closed itself). Show whatever
+      // is left rather than pointing at the tab we just closed.
+      if (tabs.length) await activate(tabs[tabs.length - 1].path);
+      if (activePath === path) goWelcome();
+    }
+    renderTabs(); // even if activation failed, the strip must match `tabs`
+    saveSession();
   };
 
+  /** Close a set of tabs in one step — no per-tab reload of soon-dead files. */
   const closeMany = async (paths: string[]) => {
-    for (const p of [...paths]) await closeTab(p);
+    const set = new Set(paths);
+    // The draft has its own confirmation flow — route it through closeTab.
+    if (tabs.some((t) => t.draft && set.has(t.path))) await closeTab(DRAFT);
+    const keep = tabs.filter((t) => t.draft || !set.has(t.path));
+    if (keep.length === tabs.length) return;
+    const closingActive =
+      activePath !== null && !keep.some((t) => t.path === activePath);
+    // Whatever document the editor holds, persist it before its tab vanishes.
+    if (editor.path && !keep.some((t) => t.path === editor.path)) {
+      if (!(await ensureSaved())) return; // a failed save leaves every tab open
+      editor.detach();
+    }
+    tabs = keep;
+    if (closingActive) {
+      if (tabs.length) await activate(tabs[tabs.length - 1].path);
+      // Activation can fail (unreadable file closes its own tab) — never
+      // leave activePath pointing at something that no longer has a tab.
+      if (activePath !== null && !tabs.some((t) => t.path === activePath)) {
+        goWelcome();
+      }
+    }
+    renderTabs();
+    saveSession();
   };
 
   /** Close every tab under `path` (used after a move/delete invalidates it). */
@@ -517,7 +585,9 @@ async function init() {
       await tree.refreshDir(parentOf(oldPath));
       return;
     }
-    if (MD_RE.test(oldPath) && !MD_RE.test(name)) name += ".md";
+    // Add `.md` only when no extension was typed at all — someone renaming
+    // `notes.md` to `notes.txt` means it, and `notes.txt.md` helps nobody.
+    if (MD_RE.test(oldPath) && !/\.[^./]+$/.test(name)) name += ".md";
     const newPath = `${parentOf(oldPath)}/${name}`;
     if (newPath === oldPath) return;
     await editor.flush(); // no pending autosave should race the on-disk move
@@ -613,7 +683,13 @@ async function init() {
   };
 
   const tree = new FileTree(treeEl, backend, {
-    onOpenFile: (p) => void openFile(p),
+    // Focus the editor once the file is up: after "click a file, start
+    // typing", keystrokes belong in the document — not in the tree, where
+    // they'd be navigation (or worse).
+    onOpenFile: (p) =>
+      void openFile(p).then((ok) => {
+        if (ok && activeTab()?.kind === "md") editor.focus();
+      }),
     onRename: (p, n) => void onRename(p, n),
     onMove: (s, d) => void onMove(s, d),
     onNewFile: (d) => void onNewFileIn(d),
@@ -681,7 +757,17 @@ async function init() {
       toast("Nothing to discard — this file matches the last commit.");
       return;
     }
-    const committed = status !== "untracked" && status !== "added";
+    // Ask the backend what discard will *actually* do rather than guessing
+    // from the status letter: a renamed file's letter reads as committed, but
+    // its new path is not in HEAD, so discard would trash it — and a dialog
+    // that promises a restore must never deliver a trashing.
+    let committed: boolean;
+    try {
+      committed = (await backend.gitDiscardKind(path)) === "restore";
+    } catch (e) {
+      toastError("Couldn’t discard", e);
+      return;
+    }
     const ok = await backend.confirmChoice(
       "Discard changes",
       committed
@@ -764,6 +850,13 @@ async function init() {
   // ------------------------------------------------------------- folder ops
 
   const setRoot = async (path: string, expanded: string[] = []) => {
+    if (rootPath && rootPath !== path) {
+      // Tabs from the previous folder would linger with no tree row, no git
+      // badge, and a session entry that resurrects them forever — close them.
+      await closeMany(
+        tabs.filter((t) => !t.draft && !isUnder(t.path, path)).map((t) => t.path),
+      );
+    }
     rootPath = path;
     folderNameEl.textContent = baseOf(path);
     folderNameEl.title = path;
@@ -773,7 +866,9 @@ async function init() {
     }
     if (isTauri) {
       const { invoke } = await import("@tauri-apps/api/core");
-      void invoke("push_recent", { path });
+      void invoke("push_recent", { path }).catch(() => {
+        /* scope-refused (corrupted recents) — the menu entry just won't stick */
+      });
     }
     await tree.setRoot(path, expanded);
     void backend.watchFolder(path).catch(() => {
@@ -788,6 +883,19 @@ async function init() {
   const openFolder = async () => {
     const picked = await backend.pickFolder();
     if (picked) await setRoot(picked);
+  };
+
+  /** Open a recents entry — which may have been moved or deleted since. */
+  const openRecent = async (path: string) => {
+    try {
+      await backend.listDir(path); // still accessible?
+    } catch {
+      toast(`Couldn’t open “${baseOf(path)}” — it may have been moved or deleted.`, {
+        kind: "error",
+      });
+      return;
+    }
+    await setRoot(path);
   };
 
   /** New File makes an *unsaved draft* — no disk file until first Save. */
@@ -1024,8 +1132,9 @@ async function init() {
       const after = escapeHtml(chars.slice(h.end).join(""));
       row.innerHTML = `<span class="ln">${h.line}</span><span class="tx">${before}<mark>${match}</mark>${after}</span>`;
       row.addEventListener("click", async () => {
-        await openFile(h.path);
-        editor.revealSourceLine(h.line);
+        // Only reveal when the file actually opened — otherwise the line
+        // would be selected in whatever document was already showing.
+        if (await openFile(h.path)) editor.revealSourceLine(h.line);
       });
       searchResults.appendChild(row);
     }
@@ -1355,98 +1464,77 @@ async function init() {
       closeDiff();
       return;
     }
-    const mod = e.metaKey || e.ctrlKey;
-    if (!mod) return;
-    const code = e.code; // physical key — robust across macOS ⌥ dead-keys
-
-    // Tab switching: ⌘1…⌘9, and ⌘⌥← / ⌘⌥→ to cycle.
-    const digit = /^Digit([1-9])$/.exec(code);
-    if (digit && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      const n = Number(digit[1]);
-      const target = n === 9 ? tabs[tabs.length - 1] : tabs[n - 1];
-      if (target) void activate(target.path);
-      return;
-    }
-    if (e.altKey && (code === "ArrowLeft" || code === "ArrowRight") && tabs.length) {
-      e.preventDefault();
-      const i = tabs.findIndex((t) => t.path === activePath);
-      const next =
-        (i + (code === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-      void activate(tabs[next].path);
-      return;
-    }
-
-    // Palette / find / search — also needed in the browser preview, where
-    // there's no native menu to own the accelerators.
-    if (code === "KeyP" && e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      void palette.show(">");
-      return;
-    }
-    if (code === "KeyP" && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      void palette.show("");
-      return;
-    }
-    if (code === "KeyK" && !e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      void palette.show(">");
-      return;
-    }
-    if (code === "KeyF" && e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      openSearch();
-      return;
-    }
-    if (code === "KeyF" && e.altKey) {
-      e.preventDefault();
-      openFind(true);
-      return;
-    }
-    if (code === "KeyF" && !e.shiftKey) {
-      e.preventDefault();
-      openFind(false);
-      return;
-    }
-    if (code === "KeyW" && activePath) {
-      e.preventDefault();
-      void closeTab(activePath);
-      return;
-    }
-    if (code === "KeyD" && e.shiftKey && !e.altKey) {
-      e.preventDefault();
-      if (activePath) void showDiff(activePath);
-      return;
-    }
-    if (code === "Backslash" && !e.shiftKey) {
-      e.preventDefault();
-      toggleSidebar();
-      return;
-    }
-
-    if (isTauri) return; // the native menu owns the rest
-    if (code === "Equal" || code === "Minus" || code === "Digit0") {
-      e.preventDefault();
-      zoom(code === "Equal" ? 1 : code === "Minus" ? -1 : 0);
-    } else if (code === "KeyS" && e.shiftKey) {
-      e.preventDefault();
-      void saveAs();
-    } else if (code === "KeyS") {
-      e.preventDefault();
-      void save();
-    } else if (code === "KeyN" && e.shiftKey) {
-      e.preventDefault();
-      newFolderHere();
-    } else if (code === "KeyN") {
-      e.preventDefault();
-      void newDraft();
-    } else if (code === "KeyM" && e.shiftKey) {
-      e.preventDefault();
-      if (isMd()) editor.toggleMode();
-    } else if (code === "KeyV" && e.shiftKey) {
-      e.preventDefault();
-      toggleSplit();
+    // The mapping lives in keys.ts (unit-tested); this switch only runs it.
+    const action = resolveKey(
+      {
+        code: e.code, // physical key — robust across macOS ⌥ dead-keys
+        meta: e.metaKey,
+        ctrl: e.ctrlKey,
+        shift: e.shiftKey,
+        alt: e.altKey,
+      },
+      { native: isTauri, paletteOpen: palette.isOpen },
+    );
+    if (!action) return;
+    e.preventDefault();
+    switch (action.kind) {
+      case "tab-digit": {
+        const target =
+          action.digit === 9 ? tabs[tabs.length - 1] : tabs[action.digit - 1];
+        if (target) void activate(target.path);
+        break;
+      }
+      case "tab-cycle": {
+        if (!tabs.length) break;
+        const i = tabs.findIndex((t) => t.path === activePath);
+        void activate(tabs[(i + action.dir + tabs.length) % tabs.length].path);
+        break;
+      }
+      case "quick-open":
+        void palette.show("");
+        break;
+      case "palette":
+        void palette.show(">");
+        break;
+      case "find":
+        openFind(false);
+        break;
+      case "find-replace":
+        openFind(true);
+        break;
+      case "search-files":
+        openSearch();
+        break;
+      case "close-tab":
+        if (activePath) void closeTab(activePath);
+        break;
+      case "show-diff":
+        if (activePath) void showDiff(activePath);
+        break;
+      case "toggle-sidebar":
+        toggleSidebar();
+        break;
+      case "zoom":
+        zoom(action.delta);
+        break;
+      case "save":
+        void save();
+        break;
+      case "save-as":
+        void saveAs();
+        break;
+      case "new-file":
+        void newDraft();
+        break;
+      case "new-folder":
+        newFolderHere();
+        break;
+      case "toggle-source":
+        if (isMd()) editor.toggleMode();
+        break;
+      case "toggle-split":
+        toggleSplit();
+        break;
     }
   });
   window.addEventListener("blur", () => void editor.flush());
@@ -1461,8 +1549,20 @@ async function init() {
     const { invoke } = await import("@tauri-apps/api/core");
     const { openUrl } = await import("@tauri-apps/plugin-opener");
 
-    // Best-effort flush with a cap so a dead disk can't wedge the close.
+    // Flush edits before quitting — with no wall-clock cap. The flush may
+    // legitimately sit on a native dialog (draft warning, save conflict) for
+    // as long as the user ponders it; the Rust backstop only covers a webview
+    // that never answers at all.
+    let exiting = false;
     const flushThenExit = async () => {
+      // ALWAYS ack first, even when re-entered: every ExitRequested arms a
+      // fresh backstop, and each one must learn the webview is alive.
+      void invoke("exit_ack").catch(() => {});
+      if (exiting) return; // one dialog, one flush — however many ⌘Qs arrive
+      exiting = true;
+      // localStorage is synchronous — the session survives even a hung flush.
+      clearTimeout(sessionTimer);
+      persistSession(localStorage, buildSession());
       // Warn before losing an unsaved draft (drafts never autosave).
       if (hasUnsavedDraft()) {
         const proceed = await backend.confirm(
@@ -1470,17 +1570,16 @@ async function init() {
           "You have an unsaved file that will be lost. Quit without saving?",
         );
         if (!proceed) {
-          void invoke("cancel_exit"); // abort ⌘Q — keep the window open
+          exiting = false; // stand down — nothing is pending on the Rust side
           return;
         }
       }
       try {
-        await Promise.race([
-          editor.flush(),
-          new Promise((r) => setTimeout(r, 3000)),
-        ]);
+        await editor.flush();
       } finally {
-        void invoke("confirm_exit");
+        void invoke("confirm_exit").catch(() => {
+          exiting = false; // IPC failed — allow another attempt over wedging
+        });
       }
     };
     void getCurrentWindow().onCloseRequested(async (e) => {
@@ -1515,7 +1614,7 @@ async function init() {
     };
     for (const [event, run] of Object.entries(menu)) void listen(event, run);
     void listen<number>("menu-zoom", (e) => zoom(e.payload));
-    void listen<string>("menu-open-recent", (e) => void setRoot(e.payload));
+    void listen<string>("menu-open-recent", (e) => void openRecent(e.payload));
 
     // The workspace changed underneath us (another app, a sync client, git…).
     void listen<{ dirs: string[]; paths: string[]; bulk: boolean; git: boolean }>(
@@ -1575,17 +1674,24 @@ async function init() {
       } catch {
         known = new Set(wanted);
       }
-      tabs = usableTabs(wanted, root, known)
+      // Merge, never replace: the user may have opened something during the
+      // async startup (the Welcome buttons are live), and restoring the
+      // previous session must not destroy what they just started.
+      const restored = usableTabs(wanted, root, known)
+        .filter((p) => !tabs.some((t) => t.path === p))
         .map((p) => ({
           path: p,
           kind: IMG_RE.test(p) ? ("img" as const) : ("md" as const),
         }));
+      tabs = [...restored, ...tabs];
       renderTabs();
-      const target =
-        saved.active && tabs.some((t) => t.path === saved.active)
-          ? saved.active
-          : (tabs[0]?.path ?? null);
-      if (target) await activate(target);
+      if (activePath === null) {
+        const target =
+          saved.active && tabs.some((t) => t.path === saved.active)
+            ? saved.active
+            : (tabs[0]?.path ?? null);
+        if (target) await activate(target);
+      }
     } else if (!isTauri) {
       await openFile("/demo/welcome.md");
     }

@@ -71,14 +71,15 @@ export function saveSession(
 }
 
 /**
- * Which remembered tabs are still worth reopening. Paths inside the workspace
- * must still exist (checked against the file index); paths outside it are kept
- * on trust, since the index doesn't cover them.
+ * Which remembered tabs are still worth reopening: paths inside the workspace
+ * that still exist (checked against the file index). Out-of-root tabs are
+ * dropped — they were reachable through a dialog grant that does not survive a
+ * restart, so restoring them would open documents that can never save again.
  */
 export function usableTabs(
   tabs: string[],
   root: string,
   known: ReadonlySet<string>,
 ): string[] {
-  return tabs.filter((p) => (p.startsWith(root + "/") ? known.has(p) : true));
+  return tabs.filter((p) => p.startsWith(root + "/") && known.has(p));
 }
