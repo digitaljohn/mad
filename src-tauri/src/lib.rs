@@ -834,7 +834,7 @@ async fn list_all(root: String) -> Result<Vec<FileHit>, String> {
             });
         }
     }
-    out.sort_by(|a, b| a.rel.to_lowercase().cmp(&b.rel.to_lowercase()));
+    out.sort_by_key(|f| f.rel.to_lowercase());
     Ok(out)
 }
 
@@ -1341,10 +1341,7 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
             collect(&mut paths, &mut git, first);
             // Coalesce the burst: editors and syncs write in several syscalls.
             let deadline = Instant::now() + Duration::from_millis(600);
-            loop {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
-                };
+            while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
                 match rx.recv_timeout(remaining.min(Duration::from_millis(160))) {
                     Ok(ev) => collect(&mut paths, &mut git, ev),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break, // quiet
@@ -1533,18 +1530,13 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::sync::atomic::AtomicU32;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
+    use std::task::{Context, Poll, Waker};
 
     /// The filesystem commands are `async` only so Tauri runs them off the UI
     /// thread — they never actually yield, so one poll completes them.
     fn run<F: Future>(fut: F) -> F::Output {
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
         let mut fut = Box::pin(fut);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => v,

@@ -19,7 +19,11 @@ concurrency:
 jobs:
   frontend:
     name: Frontend — types, tests, coverage
-    runs-on: ubuntu-latest
+    # macOS, not Linux: on this repository an ubuntu-latest job is never
+    # allocated a runner — it reports failure with zero steps and no log, while
+    # macOS jobs in the same run succeed. The tests are jsdom, so the platform
+    # makes no difference to what they prove.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
