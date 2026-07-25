@@ -76,6 +76,10 @@ export interface TreeCallbacks {
   onNewFile(dir: string): void;
   onNewFolder(dir: string): void;
   onDelete(path: string, isDir: boolean): void;
+  /** Show the file's uncommitted diff. */
+  onShowDiff(path: string): void;
+  /** Throw away the file's uncommitted changes. */
+  onDiscard(path: string, status: GitStatus): void;
   /** Folder expand/collapse changed — used to persist the session. */
   onExpandedChange?(expanded: string[]): void;
 }
@@ -605,6 +609,21 @@ export class FileTree {
             .catch((e) => toastError("Couldn’t open", e)),
       });
     }
+    const git = entry.is_dir ? undefined : this.git.get(entry.path);
+    if (git && git !== "deleted") {
+      items.push({
+        label: "Show Changes",
+        action: () => this.cb.onShowDiff(entry.path),
+      });
+    }
+    if (git && git !== "conflict") {
+      items.push({
+        label: "Discard Changes…",
+        danger: true,
+        action: () => this.cb.onDiscard(entry.path, git),
+      });
+    }
+    if (git) items.push("-");
     items.push(
       { label: "New File", action: () => this.cb.onNewFile(parentDir) },
       { label: "New Folder", action: () => this.cb.onNewFolder(parentDir) },

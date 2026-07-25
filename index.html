@@ -97,6 +97,17 @@
             </ul>
           </div>
           <div id="editor" class="hidden"></div>
+          <div id="diff-view" class="hidden" role="region" aria-label="Changes">
+            <div id="diff-head">
+              <span id="diff-title"></span>
+              <span id="diff-stat"></span>
+              <button id="diff-discard" class="btn-quiet danger">Discard Changes…</button>
+              <button id="diff-close" class="icon-btn" title="Close (Esc)" aria-label="Close changes">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+              </button>
+            </div>
+            <div id="diff-body"></div>
+          </div>
           <div id="image-viewer" class="hidden">
             <img id="image-viewer-img" alt="" />
             <div id="image-meta"></div>

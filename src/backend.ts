@@ -124,6 +124,10 @@ export interface Backend {
   ): Promise<SearchResult>;
   /** Pending git changes under `root`; null when it isn't a repository. */
   gitStatus(root: string): Promise<GitInfo | null>;
+  /** Unified diff for one file against the last commit; null if unchanged. */
+  gitDiff(path: string): Promise<string | null>;
+  /** Throw away a file's changes. Resolves "restored" or "trashed". */
+  gitDiscard(path: string): Promise<string>;
   /** Start watching `root` for external changes (emits `fs-change`). */
   watchFolder(root: string): Promise<void>;
 }
@@ -190,6 +194,8 @@ async function tauriBackend(): Promise<Backend> {
         wholeWord: opts.wholeWord,
       }),
     gitStatus: (root) => invoke<GitInfo | null>("git_status", { root }),
+    gitDiff: (path) => invoke<string | null>("git_diff", { path }),
+    gitDiscard: (path) => invoke<string>("git_discard", { path }),
     watchFolder: (root) => invoke<void>("watch_folder", { path: root }),
   };
 }
@@ -407,6 +413,15 @@ function mockBackend(): Backend {
       ].filter((e) => files.has(e.path)),
       truncated: false,
     }),
+    gitDiff: async (path) =>
+      path.endsWith("README.md")
+        ? "--- a/README.md\n+++ b/README.md\n@@ -1,5 +1,6 @@\n # README\n \n-Just a demo file.\n+Just a demo file, edited.\n+A second new line.\n"
+        : null,
+    gitDiscard: async (path) => {
+      files.set(path, "# README\n\nJust a demo file.\n");
+      touch(path);
+      return "restored";
+    },
     watchFolder: async () => {},
   };
 

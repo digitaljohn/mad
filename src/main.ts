@@ -362,6 +362,7 @@ async function init() {
     $("btn-split").classList.toggle("hidden", !isEditor);
     if (!isEditor) saveStatus.classList.add("hidden");
     if (which !== "editor") closeFind();
+    closeDiff();
   };
 
   /** Make `path` the active view (its tab must already exist). */
@@ -633,7 +634,121 @@ async function init() {
     onNewFile: (d) => void onNewFileIn(d),
     onNewFolder: (d) => void onNewFolder(d),
     onDelete: (p, isDir) => void onDelete(p, isDir),
+    onShowDiff: (p) => void showDiff(p),
+    onDiscard: (p) => void discardChanges(p),
     onExpandedChange: () => saveSession(),
+  });
+
+  // -------------------------------------------------------------- diff view
+
+  const diffView = $("diff-view");
+  const diffTitle = $("diff-title");
+  const diffStat = $("diff-stat");
+  const diffBody = $("diff-body");
+  let diffPath: string | null = null;
+
+  const closeDiff = () => {
+    diffView.classList.add("hidden");
+    diffPath = null;
+  };
+
+  /** Classify a unified-diff line. Order matters: `+++`/`---` are headers, not
+      additions and deletions. */
+  const diffClass = (line: string) => {
+    if (line.startsWith("@@")) return "hunk";
+    if (
+      /^(\+\+\+|---|diff |index |new file|deleted file|similarity |rename |old mode|new mode|Binary )/.test(
+        line,
+      )
+    )
+      return "meta";
+    if (line.startsWith("+")) return "add";
+    if (line.startsWith("-")) return "del";
+    return "ctx";
+  };
+
+  const showDiff = async (path: string) => {
+    let text: string | null;
+    try {
+      text = await backend.gitDiff(path);
+    } catch (e) {
+      toastError("Couldn’t read the diff", e);
+      return;
+    }
+    diffPath = path;
+    diffTitle.textContent =
+      rootPath && path.startsWith(rootPath + "/")
+        ? path.slice(rootPath.length + 1)
+        : baseOf(path);
+    diffBody.innerHTML = "";
+    if (!text) {
+      diffStat.textContent = "";
+      const empty = document.createElement("div");
+      empty.className = "diff-empty";
+      empty.textContent = "No uncommitted changes in this file.";
+      diffBody.appendChild(empty);
+    } else {
+      let added = 0;
+      let removed = 0;
+      const frag = document.createDocumentFragment();
+      for (const line of text.split("\n")) {
+        const cls = diffClass(line);
+        if (cls === "add") added++;
+        if (cls === "del") removed++;
+        const el = document.createElement("div");
+        el.className = `diff-line ${cls}`;
+        el.textContent = line || " ";
+        frag.appendChild(el);
+      }
+      diffBody.appendChild(frag);
+      diffStat.textContent = `+${added} −${removed}`;
+    }
+    $("diff-discard").classList.toggle("hidden", !text);
+    diffView.classList.remove("hidden");
+    diffBody.scrollTop = 0;
+  };
+
+  /** Discard one file's changes, after saying plainly what that means. */
+  const discardChanges = async (path: string) => {
+    const status = gitMap.get(path);
+    if (!status) {
+      toast("Nothing to discard — this file matches the last commit.");
+      return;
+    }
+    const committed = status !== "untracked" && status !== "added";
+    const ok = await backend.confirmChoice(
+      "Discard changes",
+      committed
+        ? `Throw away your changes to “${baseOf(path)}” and go back to the last committed version?\n\nThis cannot be undone.`
+        : `“${baseOf(path)}” has never been committed, so there is no version to go back to. It will be moved to the Trash instead.`,
+      committed ? "Discard" : "Move to Trash",
+      "Cancel",
+    );
+    if (!ok) return;
+    // Cancel any pending autosave of this document before git touches the file.
+    if (editor.path === path) await editor.flush().catch(() => {});
+    let outcome: string;
+    try {
+      outcome = await backend.gitDiscard(path);
+    } catch (e) {
+      toastError("Couldn’t discard", e);
+      return;
+    }
+    if (outcome === "trashed") {
+      await closeTabsUnder(path);
+      toast(`Moved “${baseOf(path)}” to the Trash`);
+    } else {
+      if (editor.path === path) await editor.reloadFromDisk().catch(() => {});
+      toast(`Discarded changes to “${baseOf(path)}”`);
+    }
+    if (diffPath === path) closeDiff();
+    await tree.refreshDir(parentOf(path));
+    refreshGit();
+  };
+
+  $("diff-close").addEventListener("click", closeDiff);
+  $("diff-discard").addEventListener("click", () => {
+    if (diffPath) void discardChanges(diffPath);
   });
 
   // --------------------------------------------------------------- git state
@@ -1031,6 +1146,17 @@ async function init() {
     },
     { title: "Close Tab", hint: "⌘W", run: () => activePath && void closeTab(activePath) },
     { title: "Close All Tabs", run: () => void closeMany(tabs.map((t) => t.path)) },
+    {
+      title: "Show Changes",
+      hint: "⌘⇧D",
+      run: () => activePath && void showDiff(activePath),
+      when: () => !!activePath && !!gitMap.get(activePath),
+    },
+    {
+      title: "Discard Changes…",
+      run: () => activePath && void discardChanges(activePath),
+      when: () => !!activePath && !!gitMap.get(activePath),
+    },
     { title: "Search in Files…", hint: "⌘⇧F", run: openSearch },
     { title: "Find…", hint: "⌘F", run: () => openFind(false), when: isMd },
     { title: "Find & Replace…", hint: "⌘⌥F", run: () => openFind(true), when: isMd },
@@ -1251,9 +1377,13 @@ async function init() {
   window.addEventListener("drop", (e) => e.preventDefault());
 
   window.addEventListener("keydown", (e) => {
-    // Escape closes the find bar from anywhere in the document.
+    // Escape closes the find bar, then the diff panel.
     if (e.key === "Escape" && !findBar.classList.contains("hidden")) {
       closeFind();
+      return;
+    }
+    if (e.key === "Escape" && !diffView.classList.contains("hidden")) {
+      closeDiff();
       return;
     }
     const mod = e.metaKey || e.ctrlKey;
@@ -1313,6 +1443,11 @@ async function init() {
     if (code === "KeyW" && activePath) {
       e.preventDefault();
       void closeTab(activePath);
+      return;
+    }
+    if (code === "KeyD" && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      if (activePath) void showDiff(activePath);
       return;
     }
     if (code === "Backslash" && !e.shiftKey) {
@@ -1406,6 +1541,7 @@ async function init() {
       "menu-toggle-split": () => toggleSplit(),
       "menu-toggle-sidebar": () => toggleSidebar(),
       "menu-toggle-theme": () => toggleTheme(),
+      "menu-show-changes": () => activePath && void showDiff(activePath),
     };
     for (const [event, run] of Object.entries(menu)) void listen(event, run);
     void listen<number>("menu-zoom", (e) => zoom(e.payload));

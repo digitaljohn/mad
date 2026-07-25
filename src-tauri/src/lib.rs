@@ -214,6 +214,8 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         )?)
         .item(&item("toggle_sidebar", "Toggle Sidebar", Some("CmdOrCtrl+\\"))?)
         .separator()
+        .item(&item("show_changes", "Show Changes", Some("CmdOrCtrl+Shift+D"))?)
+        .separator()
         .item(&item("toggle_theme", "Toggle Light / Dark", None)?)
         .separator()
         .item(&item("zoom_in", "Zoom In", Some("CmdOrCtrl+="))?)
@@ -1062,6 +1064,89 @@ fn expand_submodules(entries: &mut Vec<GitEntry>, depth: u8) {
     }
 }
 
+/// stdout regardless of exit status. `git diff` variants signal "differences
+/// found" with a non-zero code, which isn't a failure for our purposes.
+fn git_output_lenient(dir: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()
+}
+
+/// Unified diff for one file against the last commit, staged changes included.
+/// A file that was never committed is rendered wholly added.
+#[tauri::command]
+async fn git_diff(path: String) -> Option<String> {
+    let p = Path::new(&path);
+    let dir = p.parent()?.to_string_lossy().into_owned();
+    // Confirm we're in a repository first, or an untracked file outside one
+    // would fall through and be reported as entirely new.
+    git_output(&dir, &["rev-parse", "--show-toplevel"])?;
+    if let Some(d) = git_output_lenient(&dir, &["diff", "HEAD", "--no-color", "--", &path]) {
+        if !d.trim().is_empty() {
+            return Some(d);
+        }
+    }
+    // An empty diff for a *committed* file means it simply matches HEAD. Only a
+    // file with no committed version at all reads as wholly added — without this
+    // guard, an unchanged document would render as one giant addition.
+    if git_in_head(&dir, &path) {
+        return None;
+    }
+    // Synthesized rather than diffing against /dev/null, which isn't portable.
+    let text = fs::read_to_string(p).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    let name = p.file_name()?.to_string_lossy().into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = format!("--- /dev/null\n+++ b/{name}\n@@ -0,0 +1,{} @@\n", lines.len());
+    for l in lines {
+        out.push('+');
+        out.push_str(l);
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Does `path` exist in the last commit? Decides whether "discard" can mean
+/// "restore" at all, or whether the file has nowhere to go back to.
+fn git_in_head(dir: &str, path: &str) -> bool {
+    git_output(dir, &["ls-tree", "HEAD", "--name-only", "--", path])
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Throw away a file's uncommitted changes.
+///
+/// Returns `"restored"` when the file was put back to its committed state, or
+/// `"trashed"` when it had never been committed and so went to the OS Trash
+/// instead — there is no earlier version to restore, and silently deleting
+/// someone's new document is not an acceptable reading of "discard".
+#[tauri::command]
+async fn git_discard(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    let dir = p
+        .parent()
+        .ok_or("Invalid path")?
+        .to_string_lossy()
+        .into_owned();
+    if git_in_head(&dir, &path) {
+        // --staged --worktree so "discard" means the same thing whether or not
+        // the change had been staged.
+        git_output(&dir, &["restore", "--staged", "--worktree", "--", &path])
+            .ok_or("git restore failed")?;
+        Ok("restored".into())
+    } else {
+        let _ = git_output(&dir, &["restore", "--staged", "--", &path]); // unstage if added
+        trash::delete(&path).map_err(|e| e.to_string())?;
+        Ok("trashed".into())
+    }
+}
+
 fn git_output(dir: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new("git")
         .current_dir(dir)
@@ -1260,7 +1345,7 @@ pub fn run() {
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             // Menu items that are just a named signal to the frontend.
-            const FORWARD: [(&str, &str); 17] = [
+            const FORWARD: [(&str, &str); 18] = [
                 ("open_folder", "menu-open-folder"),
                 ("new_file", "menu-new-file"),
                 ("new_folder", "menu-new-folder"),
@@ -1278,6 +1363,7 @@ pub fn run() {
                 ("toggle_split", "menu-toggle-split"),
                 ("toggle_sidebar", "menu-toggle-sidebar"),
                 ("toggle_theme", "menu-toggle-theme"),
+                ("show_changes", "menu-show-changes"),
             ];
             if let Some((_, ev)) = FORWARD.iter().find(|(k, _)| *k == id) {
                 let _ = app.emit(ev, ());
@@ -1333,6 +1419,8 @@ pub fn run() {
             list_all,
             search_files,
             git_status,
+            git_diff,
+            git_discard,
             watch_folder,
             confirm_exit,
             cancel_exit
@@ -1817,6 +1905,117 @@ mod tests {
     /// `git_status` on a path, driven through the async command wrapper.
     fn run_cmd(dir: &Path) -> GitInfo {
         run(git_status(dir.to_string_lossy().into_owned())).expect("should be a repo")
+    }
+
+    /// A repo with one committed file, returned as (repo dir, file path).
+    fn repo_with_commit(t: &TempDir) -> (PathBuf, String) {
+        let dir = t.path().to_path_buf();
+        let g = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(&dir)
+                    .args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false),
+                "git {args:?} failed"
+            );
+        };
+        g(&["init", "--quiet", "-b", "main"]);
+        g(&["config", "user.email", "t@example.com"]);
+        g(&["config", "user.name", "t"]);
+        let file = t.write("doc.md", "one\ntwo\n");
+        g(&["add", "-A"]);
+        g(&["commit", "--quiet", "-m", "init"]);
+        (dir, file)
+    }
+
+    #[test]
+    fn diff_shows_the_change_against_the_last_commit() {
+        let t = TempDir::new();
+        let (_dir, file) = repo_with_commit(&t);
+        assert!(
+            run(git_diff(file.clone())).is_none(),
+            "an unchanged file has no diff"
+        );
+
+        fs::write(&file, "one\ntwo and a half\n").unwrap();
+        let d = run(git_diff(file.clone())).expect("modified file should diff");
+        assert!(d.contains("@@"), "expected a hunk header:\n{d}");
+        assert!(d.contains("-two"), "expected the old line:\n{d}");
+        assert!(d.contains("+two and a half"), "expected the new line:\n{d}");
+    }
+
+    #[test]
+    fn diff_renders_a_never_committed_file_as_wholly_added() {
+        let t = TempDir::new();
+        let (_dir, _) = repo_with_commit(&t);
+        let fresh = t.write("fresh.md", "alpha\nbeta\n");
+        let d = run(git_diff(fresh)).expect("untracked file should diff");
+        assert!(d.contains("--- /dev/null"), "{d}");
+        assert!(d.contains("@@ -0,0 +1,2 @@"), "{d}");
+        assert!(d.contains("+alpha") && d.contains("+beta"), "{d}");
+    }
+
+    #[test]
+    fn diff_is_none_outside_a_repository() {
+        let t = TempDir::new();
+        let loose = t.write("loose.md", "not in git\n");
+        assert!(run(git_diff(loose)).is_none());
+    }
+
+    #[test]
+    fn discarding_restores_the_committed_version() {
+        let t = TempDir::new();
+        let (_dir, file) = repo_with_commit(&t);
+        fs::write(&file, "wrecked\n").unwrap();
+        assert_eq!(run(git_discard(file.clone())).unwrap(), "restored");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn discarding_also_undoes_a_staged_change() {
+        let t = TempDir::new();
+        let (dir, file) = repo_with_commit(&t);
+        fs::write(&file, "staged edit\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["add", "-A"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(run(git_discard(file.clone())).unwrap(), "restored");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "one\ntwo\n",
+            "--staged --worktree must clear the index too"
+        );
+        // And the index is clean again, so nothing is left staged.
+        let status = run(git_status(dir.to_string_lossy().into_owned())).unwrap();
+        assert!(status.entries.is_empty(), "{:?}", status.entries);
+    }
+
+    #[test]
+    fn a_never_committed_file_has_nothing_to_restore_to() {
+        // git_discard trashes these rather than restoring, so assert the
+        // decision directly instead of littering the real Trash from a test.
+        let t = TempDir::new();
+        let (dir, file) = repo_with_commit(&t);
+        let d = dir.to_string_lossy().into_owned();
+        assert!(git_in_head(&d, &file), "committed file is in HEAD");
+        let fresh = t.write("fresh.md", "new\n");
+        assert!(!git_in_head(&d, &fresh), "untracked file is not in HEAD");
+        // Staging it does not put it in HEAD either — still nothing to go back to.
+        assert!(std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["add", "fresh.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!git_in_head(&d, &fresh), "staged-but-uncommitted is not in HEAD");
     }
 
     #[test]

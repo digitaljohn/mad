@@ -70,6 +70,13 @@ down. It updates when you save, when files move on disk, when you commit or stag
 and whenever the window regains focus — so the commit you made in a terminal thirty
 seconds ago is already on screen.
 
+`⌘⇧D` shows the diff for the document you're in: a proper unified diff against the
+last commit, staged changes included, with a `+N −M` count. A file that was never
+committed reads as wholly added, which is what it is. From there — or from the
+tree's context menu — **Discard Changes** puts a file back the way you committed
+it. It tells you plainly first, because that one is not undoable. A file with
+nothing to go back to is moved to the Trash rather than deleted.
+
 There is no refresh button. There is no refresh button anywhere in this app. That
 is deliberate.
 
@@ -159,6 +166,7 @@ Nor does it lose work:
 | `⌘1`…`⌘9`, `⌘⌥←/→` | Switch tabs |
 | `⌘F` / `⌘⌥F` / `⌘⇧F` | Find / find & replace / find in files |
 | `⌘⇧M` / `⌘⇧V` | Toggle markdown source / split preview |
+| `⌘⇧D` | Show changes for this document |
 | `⌘\` | Toggle sidebar |
 | `⌘=` / `⌘-` / `⌘0` | Zoom in / out / actual size |
 | `⌘B` `⌘I` `⌘E` | Bold / italic / inline code |

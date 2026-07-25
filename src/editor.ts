@@ -384,6 +384,26 @@ export class MarkdownEditor {
     return this.enqueue(() => this.doCheckExternal());
   }
 
+  /** Throw the buffer away and re-read from disk. Unlike checkExternalChange
+      this does not care whether there were unsaved edits — the caller has
+      already decided (discarding changes, say), so a pending autosave must be
+      cancelled before it can write the stale content back. */
+  reloadFromDisk(): Promise<void> {
+    clearTimeout(this.saveTimer);
+    return this.enqueue(async () => {
+      const path = this.currentPath;
+      if (!path || !this.crepe) return;
+      clearTimeout(this.saveTimer);
+      const data = await this.backend.readFile(path);
+      this.applyContent(data.content);
+      this.stamp = data.stamp;
+      this.lastSaved = this.content();
+      this.dirty = false;
+      this.onState("saved");
+      this.onChanged?.();
+    });
+  }
+
   private async doCheckExternal(): Promise<void> {
     const path = this.currentPath;
     if (!path || !this.crepe) return;
