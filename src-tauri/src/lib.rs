@@ -965,6 +965,18 @@ fn classify_status(x: char, y: char) -> &'static str {
     }
 }
 
+/// True for changes the sidebar can actually put a badge on: markdown, images,
+/// and directories — a dirty submodule *is* the change, even though you can't
+/// drill into it from the parent's status.
+///
+/// Everything else is dropped. A folder dot that leads nowhere is worse than no
+/// dot, and in a repo full of source this also keeps the payload small. The
+/// extension test comes first so a monorepo's thousands of changed `.c` files
+/// cost no `stat` calls.
+fn shows_in_tree(path: &Path) -> bool {
+    shown_ext(path) || (path.extension().is_none() && path.is_dir())
+}
+
 /// Parse `git status --porcelain -z` output into absolute-path entries.
 ///
 /// Porcelain paths are relative to the repository root, but they are rebuilt
@@ -994,9 +1006,6 @@ fn parse_porcelain(
         if x == 'R' || x == 'C' || y == 'R' || y == 'C' {
             let _ = fields.next();
         }
-        if out.len() >= MAX_GIT_ENTRIES {
-            return (out, true);
-        }
         let path = if prefix.is_empty() {
             Path::new(workspace).join(rel)
         } else if let Some(sub) = rel.strip_prefix(prefix) {
@@ -1006,12 +1015,51 @@ fn parse_porcelain(
             // dropping it, even though no row will match.
             Path::new(repo_root).join(rel)
         };
+        if !shows_in_tree(&path) {
+            continue;
+        }
+        // Cap only what we keep, so a repo with 20k changed source files still
+        // reports its handful of changed documents.
+        if out.len() >= MAX_GIT_ENTRIES {
+            return (out, true);
+        }
         out.push(GitEntry {
             path: path.to_string_lossy().into_owned(),
             status: classify_status(x, y),
         });
     }
     (out, false)
+}
+
+const STATUS_ARGS: [&str; 4] = [
+    "status",
+    "--porcelain",
+    "-z",
+    "--untracked-files=all",
+];
+
+/// A dirty submodule shows up in its parent's status as a single *directory*
+/// entry — the parent never says which file inside changed. So ask each dirty
+/// submodule directly and fold its answers in. Only submodules that are already
+/// reported as changed get a second `git` call, so the cost tracks real work.
+fn expand_submodules(entries: &mut Vec<GitEntry>, depth: u8) {
+    if depth == 0 {
+        return;
+    }
+    let dirs: Vec<String> = entries
+        .iter()
+        .filter(|e| Path::new(&e.path).is_dir())
+        .map(|e| e.path.clone())
+        .collect();
+    for dir in dirs {
+        let Some(raw) = git_output(&dir, &STATUS_ARGS) else {
+            continue;
+        };
+        // Inside the submodule, porcelain paths are relative to *its* root.
+        let (mut nested, _) = parse_porcelain(&dir, &dir, "", &raw);
+        expand_submodules(&mut nested, depth - 1); // submodules of submodules
+        entries.append(&mut nested);
+    }
 }
 
 fn git_output(dir: &str, args: &[&str]) -> Option<String> {
@@ -1044,18 +1092,11 @@ async fn git_status(root: String) -> Option<GitInfo> {
         .to_string();
     // `-- .` limits the walk to the open workspace; porcelain paths stay
     // relative to the repository root regardless.
-    let raw = git_output(
-        &root,
-        &[
-            "status",
-            "--porcelain",
-            "-z",
-            "--untracked-files=all",
-            "--",
-            ".",
-        ],
-    )?;
-    let (entries, truncated) = parse_porcelain(&root, &repo, &prefix, &raw);
+    let mut args = STATUS_ARGS.to_vec();
+    args.extend_from_slice(&["--", "."]);
+    let raw = git_output(&root, &args)?;
+    let (mut entries, truncated) = parse_porcelain(&root, &repo, &prefix, &raw);
+    expand_submodules(&mut entries, 3);
     Some(GitInfo {
         root: repo,
         entries,
@@ -1679,6 +1720,103 @@ mod tests {
                 "/private/var/work/elsewhere/c.md",
             ]
         );
+    }
+
+    #[test]
+    fn only_changes_the_sidebar_can_show_are_reported() {
+        // A folder dot must always lead somewhere, so changes to files the tree
+        // never renders are dropped rather than left as an untraceable mark.
+        let raw = " M docs/a.md\0 M firmware/main.c\0?? notes/pic.png\0 M Makefile\0";
+        let (entries, _) = parse_porcelain("/w", "/w", "", raw);
+        let got: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(got, vec!["/w/docs/a.md", "/w/notes/pic.png"]);
+    }
+
+    #[test]
+    fn the_entry_cap_counts_only_what_is_kept() {
+        // 6000 changed source files must not crowd out the one document.
+        let mut raw = String::new();
+        for i in 0..6000 {
+            raw.push_str(&format!(" M src/f{i}.c\0"));
+        }
+        raw.push_str(" M README.md\0");
+        let (entries, truncated) = parse_porcelain("/w", "/w", "", &raw);
+        assert!(!truncated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "/w/README.md");
+    }
+
+    /// Shells out to real git, with a real submodule, to prove the three cases
+    /// the sidebar has to get right.
+    #[test]
+    fn git_status_descends_into_dirty_submodules() {
+        let t = TempDir::new();
+        let run = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(dir)
+                // Local submodule paths need this on modern git.
+                .args(["-c", "protocol.file.allow=always"])
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed in {dir:?}");
+        };
+        let init = |dir: &Path| {
+            run(dir, &["init", "--quiet", "-b", "main"]);
+            run(dir, &["config", "user.email", "t@example.com"]);
+            run(dir, &["config", "user.name", "t"]);
+        };
+
+        // An inner repo that will become a submodule.
+        let inner = t.path().join("inner");
+        fs::create_dir_all(inner.join("docs")).unwrap();
+        init(&inner);
+        fs::write(inner.join("docs/inner.md"), "one\n").unwrap();
+        run(&inner, &["add", "-A"]);
+        run(&inner, &["commit", "--quiet", "-m", "init"]);
+
+        // The outer repo: a nested document, a source file, and the submodule.
+        let outer = t.path().join("outer");
+        fs::create_dir_all(outer.join("docs/deep")).unwrap();
+        fs::create_dir_all(outer.join("firmware")).unwrap();
+        init(&outer);
+        fs::write(outer.join("docs/deep/nested.md"), "spec\n").unwrap();
+        fs::write(outer.join("firmware/main.c"), "int main(){}\n").unwrap();
+        run(&outer, &["submodule", "add", "--quiet", "../inner", "vendor"]);
+        run(&outer, &["add", "-A"]);
+        run(&outer, &["commit", "--quiet", "-m", "init"]);
+
+        // Dirty one of each kind.
+        fs::write(outer.join("docs/deep/nested.md"), "spec changed\n").unwrap();
+        fs::write(outer.join("firmware/main.c"), "// changed\n").unwrap();
+        fs::write(outer.join("vendor/docs/inner.md"), "one\ntwo\n").unwrap();
+
+        let info = run_cmd(&outer);
+        let by: std::collections::HashMap<String, &str> = info
+            .entries
+            .iter()
+            .map(|e| (e.path.clone(), e.status))
+            .collect();
+        let at = |rel: &str| outer.join(rel).to_string_lossy().into_owned();
+
+        // Nested documents: badged directly.
+        assert_eq!(by.get(&at("docs/deep/nested.md")), Some(&"modified"));
+        // The submodule directory is itself the change, so it keeps its mark…
+        assert_eq!(by.get(&at("vendor")), Some(&"modified"));
+        // …and we descend into it so the file inside is findable too.
+        assert_eq!(by.get(&at("vendor/docs/inner.md")), Some(&"modified"));
+        // Source the sidebar can't render is not reported at all.
+        assert!(!by.contains_key(&at("firmware/main.c")));
+        assert!(by.keys().all(|k| !k.ends_with(".c")));
+    }
+
+    /// `git_status` on a path, driven through the async command wrapper.
+    fn run_cmd(dir: &Path) -> GitInfo {
+        run(git_status(dir.to_string_lossy().into_owned())).expect("should be a repo")
     }
 
     #[test]
