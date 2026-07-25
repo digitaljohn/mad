@@ -7,6 +7,23 @@ source, permanently.
 
 ![mad](docs/screenshot-dark.png)
 
+## Install
+
+Grab the latest `.dmg` from [Releases](https://github.com/digitaljohn/mad/releases),
+open it, and drag **mad** to Applications. One universal build covers both Apple
+Silicon and Intel.
+
+The first launch needs one extra click, because these builds aren't signed with a
+paid Apple Developer ID: macOS will say it can't verify the app, and you open
+**System Settings → Privacy & Security** and click **Open Anyway**. Once per
+install. If you'd rather not click through it:
+
+```bash
+xattr -d com.apple.quarantine /Applications/mad.app
+```
+
+Or build it yourself — see [Running it](#running-it).
+
 ## Why this exists
 
 I work in a hardware team. The documentation lives in markdown — a folder of specs,
@@ -189,6 +206,8 @@ npm run test:rust     # 54 Rust tests, several against real git repositories
 npm run check         # everything CI runs: types, both suites, coverage, clippy
 npm run tauri build
 ```
+
+Releases are cut by tagging; see [docs/RELEASING.md](docs/RELEASING.md).
 
 Every pull request runs the lot on CI, plus a release build. Coverage of the
 tested frontend modules is enforced at 100% statements/functions/lines — see
