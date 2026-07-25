@@ -5,6 +5,11 @@
     "module": "ESNext",
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
+    /* Vite's ambient declarations, which give `import "./styles.css"` a type.
+       TypeScript 7 rejects a side-effect import with no declaration (TS2882);
+       before that it quietly allowed them, which is why this was never
+       needed. Vite is what actually resolves these imports at build time. */
+    "types": ["vite/client"],
 
     /* Bundler mode */
     "moduleResolution": "bundler",

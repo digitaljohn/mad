@@ -291,6 +291,11 @@ describe("resolveLink", () => {
     expect(resolveLink("./spec.md", null)).toEqual({ kind: "ignore" });
   });
 
+  it("ignores a link that is only a query string", () => {
+    // Nothing left once the query is stripped, so there is no file to open.
+    expect(resolveLink("?v=2", doc)).toEqual({ kind: "ignore" });
+  });
+
   it("ignores empty and missing hrefs", () => {
     expect(resolveLink("", doc)).toEqual({ kind: "ignore" });
     expect(resolveLink(null, doc)).toEqual({ kind: "ignore" });

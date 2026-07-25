@@ -121,6 +121,7 @@ describe("checkForUpdates", () => {
 
   it("copes with a download that never reports a length", async () => {
     const downloadAndInstall = vi.fn(async (onEvent) => {
+      onEvent({ event: "Started" }); // no data at all
       onEvent({ event: "Started", data: {} });
       onEvent({ event: "Progress", data: { chunkLength: 1024 } });
       onEvent({ event: "Progress", data: {} }); // a chunk event with no size
