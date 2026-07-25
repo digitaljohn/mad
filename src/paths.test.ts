@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  resolveLink,
   baseOf,
   countWords,
   dirOf,
@@ -207,5 +208,93 @@ describe("readingMinutes", () => {
   it("rounds to the nearest minute at ~220wpm", () => {
     expect(readingMinutes(220)).toBe(1);
     expect(readingMinutes(700)).toBe(3);
+  });
+});
+
+describe("resolveLink", () => {
+  const doc = "/w/docs/guide.md";
+
+  it("opens a relative note in mad, not the browser", () => {
+    // The bug: the DOM resolves "./spec.md" against the webview origin, so
+    // a.href reads "http://localhost/spec.md" and a link to the note next
+    // door was indistinguishable from a link to the open internet.
+    expect(resolveLink("./spec.md", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/spec.md",
+    });
+    expect(resolveLink("spec.md", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/spec.md",
+    });
+  });
+
+  it("climbs out of the current folder", () => {
+    expect(resolveLink("../notes/todo.md", doc)).toEqual({
+      kind: "file",
+      path: "/w/notes/todo.md",
+    });
+  });
+
+  it("takes an absolute path as written", () => {
+    expect(resolveLink("/other/a.md", doc)).toEqual({
+      kind: "file",
+      path: "/other/a.md",
+    });
+  });
+
+  it("sends anything with a scheme to the OS", () => {
+    for (const url of [
+      "https://example.com/x",
+      "http://example.com",
+      "mailto:someone@example.com",
+      "HTTPS://EXAMPLE.COM",
+    ]) {
+      expect(resolveLink(url, doc)).toEqual({ kind: "external", url });
+    }
+  });
+
+  it("treats a bare fragment as a heading in this document", () => {
+    expect(resolveLink("#some-heading", doc)).toEqual({
+      kind: "anchor",
+      id: "some-heading",
+    });
+  });
+
+  it("drops a query or fragment hanging off a file link", () => {
+    expect(resolveLink("spec.md#section", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/spec.md",
+    });
+    expect(resolveLink("spec.md?v=2", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/spec.md",
+    });
+  });
+
+  it("decodes escaped spaces, which is how writers link such files", () => {
+    expect(resolveLink("my%20notes.md", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/my notes.md",
+    });
+  });
+
+  it("leaves a malformed escape alone rather than throwing", () => {
+    expect(() => resolveLink("100%.md", doc)).not.toThrow();
+    expect(resolveLink("100%.md", doc)).toEqual({
+      kind: "file",
+      path: "/w/docs/100%.md",
+    });
+  });
+
+  it("ignores a relative link with no document to resolve against", () => {
+    // An unsaved draft has no folder, so "./spec.md" means nothing yet.
+    expect(resolveLink("./spec.md", null)).toEqual({ kind: "ignore" });
+  });
+
+  it("ignores empty and missing hrefs", () => {
+    expect(resolveLink("", doc)).toEqual({ kind: "ignore" });
+    expect(resolveLink(null, doc)).toEqual({ kind: "ignore" });
+    expect(resolveLink("   ", doc)).toEqual({ kind: "ignore" });
+    expect(resolveLink("#", doc)).toEqual({ kind: "anchor", id: "" });
   });
 });

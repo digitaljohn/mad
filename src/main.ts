@@ -19,6 +19,7 @@ import {
   isUnder,
   parentOf,
   remapPath,
+  resolveLink,
 } from "./paths";
 import {
   clampScale,
@@ -1562,6 +1563,47 @@ async function init() {
     saveSession();
   });
 
+  // Links: a link to another note opens it here; the web opens out there.
+  // Not inside the isTauri block — following a link between documents is the
+  // app working, not a desktop integration, and it has to work in the browser
+  // build too (which is also the only place it can be tested).
+  const openExternal = async (url: string) => {
+    if (!isTauri) {
+      window.open(url, "_blank", "noopener");
+      return;
+    }
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+    await openUrl(url);
+  };
+  document.addEventListener(
+    "click",
+    (e) => {
+      const el = e.target instanceof Element ? e.target : null;
+      const a = el?.closest("a[href]") as HTMLAnchorElement | null;
+      if (!a) return;
+      // The raw attribute, never a.href — see resolveLink.
+      const target = resolveLink(a.getAttribute("href"), editor.path);
+      if (target.kind === "ignore") return;
+      e.preventDefault();
+      if (target.kind === "external") {
+        void openExternal(target.url).catch((err) =>
+          toastError("Couldn’t open that link", err),
+        );
+      } else if (target.kind === "anchor") {
+        editor.scrollToHeading(target.id);
+      } else if (MD_RE.test(target.path) || IMG_RE.test(target.path)) {
+        // Something mad can show: open it in a tab, like the tree would.
+        void openFile(target.path);
+      } else {
+        // A PDF, a spreadsheet, a folder — hand it to the OS.
+        void backend
+          .openPath(target.path)
+          .catch((err) => toastError(`Couldn’t open ${baseOf(target.path)}`, err));
+      }
+    },
+    true,
+  );
+
   // A drop the editor doesn't claim must never navigate the window away.
   window.addEventListener("dragover", (e) => e.preventDefault());
   window.addEventListener("drop", (e) => {
@@ -1671,7 +1713,6 @@ async function init() {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const { listen } = await import("@tauri-apps/api/event");
     const { invoke } = await import("@tauri-apps/api/core");
-    const { openUrl } = await import("@tauri-apps/plugin-opener");
 
     // Put this window's work safely on disk, asking about anything that would
     // be lost. Resolves false if the user decided to stay.
@@ -1791,19 +1832,6 @@ async function init() {
     // the first window, or every window would race for the same download.
     if (isMainWindow) setTimeout(() => runUpdateCheck(true), 4000);
 
-    // External links open in the system browser, not the webview.
-    document.addEventListener(
-      "click",
-      (e) => {
-        const el = e.target instanceof Element ? e.target : null;
-        const a = el?.closest("a[href]") as HTMLAnchorElement | null;
-        if (a && /^https?:/i.test(a.href)) {
-          e.preventDefault();
-          void openUrl(a.href);
-        }
-      },
-      true,
-    );
   }
 
   updateMenuState();
