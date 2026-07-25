@@ -3,7 +3,7 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
-## Unreleased
+## 0.2.0 — 2026-07-25
 
 ### Added
 
@@ -17,9 +17,10 @@ a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
 ### Fixed — data safety
 
-- Discarding changes to a file whose name contains `[`, `]`, `*` or `?` could
-  move the whole document to the Trash instead of restoring it (git pathspec
-  globbing). Git now treats every path literally.
+- Discarding changes to a file whose name contains `*` or `?` also reverted
+  every other file the wildcard happened to match — throwing away unsaved
+  work in documents you never touched. Git treats a pathspec as a glob; it
+  now receives every path literally.
 - The discard dialog promises exactly what will happen: a renamed file has no
   committed version under its new name, and the dialog now says "Move to
   Trash" instead of promising a restore it can't deliver.
@@ -30,6 +31,8 @@ a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
   dialog needs — the only force-quit left is for a webview that never answers.
 - Every filesystem command is scoped to dialog-granted folders and files —
   defense-in-depth so nothing running in the window can leave the workspace.
+- "Open Recent ▸ Clear Menu" no longer revokes access to the folder you have
+  open, which had made the next launch lose the workspace and every tab.
 
 ### Fixed — things that silently didn't work
 
