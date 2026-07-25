@@ -1,5 +1,5 @@
 import type { Backend, Entry, GitInfo, GitStatus } from "./backend";
-import { TREE_IMAGE_DND } from "./editor";
+import { TREE_IMAGE_DND, TREE_MOVE_DND } from "./dnd";
 import { toast, toastError } from "./toast";
 
 const CHEVRON = `<svg class="chevron" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg>`;
@@ -9,9 +9,7 @@ const FOLDER_ICON = `<svg class="row-icon" width="14" height="14" viewBox="0 0 1
 const MD_ICON = `<svg class="row-icon md" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3.25" width="14" height="9.5" rx="2"/><path d="M3.5 10.25v-4.5l1.9 2.2 1.9-2.2v4.5"/><path d="M11.6 5.75v4.5m-1.7-1.8 1.7 1.8 1.7-1.8"/></svg>`;
 const IMG_ICON = `<svg class="row-icon img" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="2"/><circle cx="5.9" cy="6.4" r="1.15"/><path d="M2.5 11.6 6 8.25l2.4 2.35 2.1-2.1 3 3"/></svg>`;
 
-const IMG_RE = /\.(png|jpe?g|gif|svg|webp|bmp|avif)$/i;
-/** dataTransfer type for dragging a tree row to move it between folders. */
-const TREE_MOVE_DND = "application/x-mad-move";
+import { IMG_RE, MD_RE, baseOf, parentOf } from "./paths";
 
 /** Single-letter badge per git state, and which one wins on a folder. */
 const GIT_BADGE: Record<GitStatus, string> = {
@@ -48,7 +46,7 @@ export const GIT_LABEL: Record<GitStatus, string> = {
 };
 
 export function fileIcon(name: string): string {
-  if (/\.(md|markdown)$/i.test(name)) return MD_ICON;
+  if (MD_RE.test(name)) return MD_ICON;
   if (IMG_RE.test(name)) return IMG_ICON;
   return FILE_ICON;
 }
@@ -183,7 +181,7 @@ export class FileTree {
     container.addEventListener("contextmenu", (e) => {
       if (e.target !== container) return; // row handlers cover their own rows
       e.preventDefault();
-      if (this.root) this.rootMenu(e.clientX, e.clientY);
+      if (this.root) this.rootMenu(e.clientX, e.clientY, this.root);
     });
     container.addEventListener("keydown", (e) => this.onKeyDown(e));
   }
@@ -216,12 +214,12 @@ export class FileTree {
       this.git.set(e.path, e.status);
       // Propagate up to (but not past) the workspace root.
       const stop = this.root;
-      let dir = e.path.slice(0, e.path.lastIndexOf("/"));
+      let dir = parentOf(e.path);
       while (dir && (!stop || dir.startsWith(stop))) {
         const cur = this.gitDirs.get(dir);
         if (!cur || GIT_RANK[e.status] > GIT_RANK[cur]) this.gitDirs.set(dir, e.status);
         if (dir === stop) break;
-        const next = dir.slice(0, dir.lastIndexOf("/"));
+        const next = parentOf(dir);
         if (next === dir) break;
         dir = next;
       }
@@ -581,12 +579,12 @@ export class FileTree {
   }
 
   private async duplicate(path: string) {
-    const parent = path.slice(0, path.lastIndexOf("/"));
+    const parent = parentOf(path);
     try {
       const created = await this.backend.duplicatePath(path);
       await this.refreshDir(parent);
       await this.reveal(created);
-      toast(`Duplicated as “${created.split("/").pop()}”`);
+      toast(`Duplicated as “${baseOf(created)}”`);
     } catch (e) {
       toastError("Couldn’t duplicate", e);
     }
@@ -596,9 +594,7 @@ export class FileTree {
     this.selected = entry.path;
     this.focusPath = entry.path;
     this.render();
-    const parentDir = entry.is_dir
-      ? entry.path
-      : entry.path.slice(0, entry.path.lastIndexOf("/"));
+    const parentDir = entry.is_dir ? entry.path : parentOf(entry.path);
     const items: (MenuItem | "-")[] = [];
     if (!entry.is_dir) {
       items.push({
@@ -652,9 +648,9 @@ export class FileTree {
     showContextMenu(x, y, items);
   }
 
-  private rootMenu(x: number, y: number) {
-    if (!this.root) return;
-    const root = this.root;
+  /** `root` is passed in because the caller has already established there is
+      one — re-checking here would be an unreachable branch. */
+  private rootMenu(x: number, y: number, root: string) {
     showContextMenu(x, y, [
       { label: "New File", action: () => this.cb.onNewFile(root) },
       { label: "New Folder", action: () => this.cb.onNewFolder(root) },

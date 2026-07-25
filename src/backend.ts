@@ -372,7 +372,9 @@ function mockBackend(): Backend {
       return [...files.keys()]
         .filter((f) => f.startsWith(pref))
         .map((f) => ({ path: f, rel: f.slice(pref.length) }))
-        .sort((a, b) => a.rel.localeCompare(b.rel));
+        // Lowercase comparison, matching Rust's list_all — the mock is only
+        // useful as a stand-in if it orders results the same way.
+        .sort((a, b) => a.rel.toLowerCase().localeCompare(b.rel.toLowerCase()));
     },
     searchFiles: async (root, query, opts) => {
       if (!query.trim()) return { hits: [], truncated: false };

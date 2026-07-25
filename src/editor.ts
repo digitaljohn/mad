@@ -26,6 +26,17 @@ import {
 } from "prosemirror-search";
 import { imageBlockSchema } from "@milkdown/kit/component/image-block";
 import { isConflict, type Backend } from "./backend";
+import { TREE_IMAGE_DND } from "./dnd";
+import {
+  dirOf,
+  escapeHtml,
+  escapeRe,
+  normalize,
+  normalizeTrailer,
+  countWords,
+  readingMinutes,
+  relativize,
+} from "./paths";
 import { toast, toastError } from "./toast";
 
 /**
@@ -140,45 +151,6 @@ const tightBulletLists = bulletListSchema.extendSchema((prev) => (ctx) => {
 
 /** Largest image we'll base64 through the IPC bridge. */
 const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
-
-/** Collapse `.` / `..` segments of an absolute POSIX path. */
-function normalize(path: string): string {
-  const out: string[] = [];
-  for (const seg of path.split("/")) {
-    if (seg === "" || seg === ".") continue;
-    if (seg === "..") out.pop();
-    else out.push(seg);
-  }
-  return "/" + out.join("/");
-}
-
-function dirOf(path: string): string {
-  const i = path.lastIndexOf("/");
-  return i > 0 ? path.slice(0, i) : "/";
-}
-
-/** Relative path from `fromDir` to `target` (both absolute POSIX paths). */
-function relativize(fromDir: string, target: string): string {
-  const from = fromDir.split("/").filter(Boolean);
-  const to = target.split("/").filter(Boolean);
-  let i = 0;
-  while (i < from.length && i < to.length && from[i] === to[i]) i++;
-  return [...Array(from.length - i).fill(".."), ...to.slice(i)].join("/");
-}
-
-function escapeRe(s: string) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Exactly one trailing newline, the way every other text editor writes files.
-    ProseMirror keeps a trailing empty paragraph that would otherwise add a
-    blank line on the first save of every document. */
-function normalizeTrailer(md: string): string {
-  return md.trim() ? md.replace(/\n+$/, "") + "\n" : "";
-}
-
-/** dataTransfer type used for drags out of the sidebar tree. */
-export const TREE_IMAGE_DND = "application/x-mad-image";
 
 export class MarkdownEditor {
   private crepe: Crepe | null = null;
@@ -467,7 +439,7 @@ export class MarkdownEditor {
   /** Word / character / line counts for the status bar. */
   getStats(): DocStats {
     const text = this.content();
-    const words = text.trim() ? (text.trim().match(/[\p{L}\p{N}'’-]+/gu)?.length ?? 0) : 0;
+    const words = countWords(text);
     const lines = text ? text.split("\n").length : 0;
     let cursor: DocStats["cursor"] = null;
     if (this._mode === "source" && document.activeElement === this.sourceEl) {
@@ -479,7 +451,7 @@ export class MarkdownEditor {
       words,
       chars: text.length,
       lines,
-      readingMinutes: words ? Math.max(1, Math.round(words / 220)) : 0,
+      readingMinutes: readingMinutes(words),
       cursor,
     };
   }
@@ -1252,8 +1224,7 @@ export class MarkdownEditor {
 
 /** Wrap serialized body HTML in a self-contained, readable document. */
 function htmlDocument(title: string, body: string): string {
-  const esc = (s: string) =>
-    s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+  const esc = escapeHtml;
   return `<!doctype html>
 <html lang="en">
 <head>

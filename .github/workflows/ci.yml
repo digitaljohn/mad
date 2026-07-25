@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only first-party `actions/*` steps are used here. Repositories can be
+# configured to allow nothing else, and a workflow that reaches for a
+# third-party action then fails before any job starts — with no log to explain
+# itself. Toolchains are set up with plain shell instead: rustup and Rust are
+# preinstalled on GitHub's runners.
+jobs:
+  frontend:
+    name: Frontend — types, tests, coverage
+    # macOS, not Linux: on this repository an ubuntu-latest job is never
+    # allocated a runner — it reports failure with zero steps and no log, while
+    # macOS jobs in the same run succeed. The tests are jsdom, so the platform
+    # makes no difference to what they prove.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test with coverage
+        # The thresholds in vitest.config.ts fail the job on a regression, so
+        # this is the gate as well as the report.
+        run: npm run test:coverage
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+              const t = require("./coverage/coverage-summary.json").total;
+              console.log("| Metric | Covered | Count |");
+              console.log("| --- | --- | --- |");
+              for (const k of ["statements", "branches", "functions", "lines"]) {
+                console.log("| " + k + " | " + t[k].pct + "% | " + t[k].covered + "/" + t[k].total + " |");
+              }
+            ' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build the bundle
+        run: npm run build
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: coverage/
+          retention-days: 14
+
+  rust:
+    name: Rust — fmt, clippy, tests, coverage
+    # macOS because the app is macOS-first and the Tauri crate builds here
+    # without the webkit2gtk system packages a Linux runner would need.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup component add rustfmt clippy llvm-tools-preview
+          rustc --version && cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Tauri's build script wants the frontend dist to exist.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      - name: Formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Configure git for the tests
+        # Several tests build throwaway repositories; git needs an identity, and
+        # permission to use a local path as a submodule source.
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global protocol.file.allow always
+
+      - name: Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary rather than `cargo install`, which would spend minutes
+        # compiling it on every run.
+        run: |
+          case "$(uname -m)" in
+            arm64|aarch64) TARGET=aarch64-apple-darwin ;;
+            *)             TARGET=x86_64-apple-darwin ;;
+          esac
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-$TARGET.tar.gz" \
+            | tar xzf - -C "$HOME/.cargo/bin"
+          cargo llvm-cov --version
+
+      - name: Coverage
+        run: |
+          cargo llvm-cov --manifest-path src-tauri/Cargo.toml \
+            --lcov --output-path lcov.info --summary-only \
+            | tee rust-coverage.txt
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '### Rust coverage'
+            echo '```'
+            tail -6 rust-coverage.txt || true
+            echo '```'
+            echo '_The Tauri app shell — run(), menu construction and the blocking'
+            echo 'native dialogs — cannot execute without a real window, so it is'
+            echo 'not counted as testable. See CONTRIBUTING.md._'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-coverage
+          path: |
+            lcov.info
+            rust-coverage.txt
+          retention-days: 14
+
+  app:
+    name: App — release build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # Proves the thing compiles and links for release, which the unit tests
+      # never do: they don't build the binary or run the Tauri build script that
+      # validates tauri.conf.json and the capabilities.
+      - name: Build
+        run: npm run tauri build -- --no-bundle
