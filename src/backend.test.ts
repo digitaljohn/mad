@@ -130,6 +130,38 @@ describe("rename and move", () => {
     await expect(be.readFile("/demo/README.md")).rejects.toThrow();
   });
 
+  it("dedupes extensionless names without inventing an extension", async () => {
+    // "LICENSE 2", not "LICENSE 2.undefined" — the stem/ext split must cope.
+    expect(await be.createFile("/demo", "LICENSE")).toBe("/demo/LICENSE");
+    expect(await be.createFile("/demo", "LICENSE")).toBe("/demo/LICENSE 2");
+    expect(await be.saveImage("/demo", "img", "")).toBe("img");
+    expect(await be.saveImage("/demo", "img", "")).toBe("img 2");
+  });
+
+  it("trashes a folder with nested subfolders in one go", async () => {
+    await be.createFolder("/demo/journal", "deep");
+    await be.trashPath("/demo/journal");
+    const names = (await be.listDir("/demo")).map((e) => e.name);
+    expect(names).not.toContain("journal");
+    expect(await be.listDir("/demo/journal/deep")).toEqual([]);
+  });
+
+  it("renames a folder together with the subfolders inside it", async () => {
+    await be.createFolder("/demo/journal", "deep");
+    await be.createFile("/demo/journal/deep", "x.md");
+    await be.renamePath("/demo/journal", "/demo/log");
+    expect((await be.readFile("/demo/log/deep/x.md")).content).toBe("");
+    const names = (await be.listDir("/demo/log")).map((e) => e.name);
+    expect(names).toContain("deep");
+  });
+
+  it("duplicates a folder as an empty sibling, the way the mock models dirs", async () => {
+    const copy = await be.duplicatePath("/demo/journal");
+    expect(copy).toBe("/demo/journal copy");
+    const names = (await be.listDir("/demo")).map((e) => e.name);
+    expect(names).toContain("journal copy");
+  });
+
   it("refuses to rename over an existing entry", async () => {
     await expect(
       be.renamePath("/demo/README.md", "/demo/welcome.md"),
@@ -278,6 +310,12 @@ describe("git helpers in the mock", () => {
     expect(await be.gitDiscard("/demo/README.md")).toBe("restored");
     expect((await be.readFile("/demo/README.md")).content).toContain("Just a demo file");
   });
+
+  it("predicts the discard outcome the way the Rust side would", async () => {
+    // README is "committed" in the mock's world; everything else is not.
+    expect(await be.gitDiscardKind("/demo/README.md")).toBe("restore");
+    expect(await be.gitDiscardKind("/demo/journal/ideas.md")).toBe("trash");
+  });
 });
 
 describe("dialogs and shell in the mock", () => {
@@ -304,6 +342,16 @@ describe("dialogs and shell in the mock", () => {
   it("passes the export name through", async () => {
     vi.spyOn(window, "prompt").mockReturnValue("out.html");
     expect(await be.exportDialog("out.html", "/demo", "html")).toBe("/demo/out.html");
+  });
+
+  it("returns null when the export dialog is cancelled", async () => {
+    vi.spyOn(window, "prompt").mockReturnValue(null);
+    expect(await be.exportDialog("out.html", null, "html")).toBe(null);
+  });
+
+  it("export falls back to the demo root when no directory is offered", async () => {
+    vi.spyOn(window, "prompt").mockReturnValue("out.html");
+    expect(await be.exportDialog("out.html", null, "html")).toBe("/demo/out.html");
   });
 
   it("relays confirmations", async () => {
