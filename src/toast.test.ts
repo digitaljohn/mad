@@ -73,18 +73,35 @@ describe("toast", () => {
     expect(texts()).toEqual([]);
   });
 
-  it("returns a dismiss function the caller can drive", () => {
-    const close = toast("a", { duration: 0 });
-    close();
+  it("returns a handle the caller can dismiss", () => {
+    const h = toast("a", { duration: 0 });
+    h.dismiss();
     vi.advanceTimersByTime(200);
     expect(texts()).toEqual([]);
   });
 
   it("does not throw when dismissed twice", () => {
-    const close = toast("a", { duration: 0 });
-    close();
-    expect(() => close()).not.toThrow();
+    const h = toast("a", { duration: 0 });
+    h.dismiss();
+    expect(() => h.dismiss()).not.toThrow();
     vi.advanceTimersByTime(200);
+  });
+
+  it("updates its text in place, for progress on long work", () => {
+    const h = toast("Downloading… 0%", { duration: 0 });
+    h.setText("Downloading… 62%");
+    expect(texts()).toEqual(["Downloading… 62%"]);
+    // Same element — the toast must not flicker out and back.
+    expect(document.querySelectorAll(".toast")).toHaveLength(1);
+  });
+
+  it("can change kind, so work that fails turns into an error", () => {
+    const h = toast("Working", { duration: 0 });
+    expect(document.querySelector(".toast")!.className).toContain("info");
+    h.setKind("error");
+    const cls = document.querySelector(".toast")!.className;
+    expect(cls).toContain("error");
+    expect(cls).not.toContain("info");
   });
 });
 

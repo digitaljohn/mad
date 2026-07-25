@@ -49,6 +49,21 @@ jobs:
           npx tsc --noEmit
           npm run test:coverage
 
+      - name: Require the update signing key
+        # With an updater pubkey in tauri.conf.json the bundler *fails* without
+        # the matching private key — it does not fall back to unsigned. Better
+        # to say so in ten seconds than to die five minutes into a build.
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set."
+            echo "The updater is configured, so release builds need the signing key."
+            echo "See docs/RELEASING.md — 'Self-update'."
+            exit 1
+          fi
+          echo "signing key present"
+
       - name: Rust toolchain with both Mac architectures
         run: |
           rustup update --no-self-update stable
@@ -91,6 +106,9 @@ jobs:
 
       - name: Build
         env:
+          # Required, not optional: see the check above.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           # Present only if configured; Tauri signs when it sees an identity and
           # notarizes when it sees credentials, and skips both otherwise.
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -101,19 +119,56 @@ jobs:
 
       - name: Collect the artifacts
         id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
           mkdir -p dist-release
-          # The .dmg is what people download; the .app.tar.gz is handy for
-          # scripted installs and for a future updater.
+          # The .dmg is what people download by hand. The .app.tar.gz and its
+          # .sig are what the in-app updater consumes — both are produced by the
+          # bundler because createUpdaterArtifacts is on, so don't roll our own.
           find "$BUNDLE/dmg" -name '*.dmg' -exec cp {} dist-release/ \;
-          if [ -d "$BUNDLE/macos" ]; then
-            tar -czf "dist-release/mad_${{ steps.version.outputs.version }}_universal.app.tar.gz" \
-              -C "$BUNDLE/macos" mad.app
-          fi
+          find "$BUNDLE/macos" -name '*.app.tar.gz' -exec cp {} dist-release/ \;
+          find "$BUNDLE/macos" -name '*.app.tar.gz.sig' -exec cp {} dist-release/ \;
           cd dist-release && shasum -a 256 * > SHA256SUMS.txt
           ls -la
           cat SHA256SUMS.txt
+
+      - name: Write the update manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SIG_FILE="$(find dist-release -name '*.app.tar.gz.sig' | head -1)"
+          TAR_FILE="$(find dist-release -name '*.app.tar.gz' | head -1)"
+          if [ -z "$SIG_FILE" ] || [ -z "$TAR_FILE" ]; then
+            echo "::error::The build produced no signed update bundle."
+            exit 1
+          fi
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          URL="$BASE/$(basename "$TAR_FILE")"
+          SIG="$(cat "$SIG_FILE")"
+          NOTES="See https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"
+          # One universal bundle serves every Mac, but the updater looks the
+          # platform up by exact target triple — so list all three keys.
+          node -e '
+            const [version, notes, url, signature] = process.argv.slice(1);
+            const platform = { signature, url };
+            const manifest = {
+              version,
+              notes,
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "darwin-universal": platform,
+                "darwin-aarch64": platform,
+                "darwin-x86_64": platform,
+              },
+            };
+            require("fs").writeFileSync(
+              "dist-release/latest.json",
+              JSON.stringify(manifest, null, 2) + "\n",
+            );
+          ' "$VERSION" "$NOTES" "$URL" "$SIG"
+          cat dist-release/latest.json
 
       - name: Report what was signed
         run: |
@@ -150,11 +205,13 @@ jobs:
           if codesign -dv "$APP" 2>&1 | grep -q 'Authority=Developer ID'; then
             SIGNED_NOTE=""
           fi
+          UPDATE_NOTE=$'\n\nAlready running mad? **mad ▸ Check for Updates…** will fetch this for you.'
           cat > notes.md <<EOF
           ## Install
 
           Download \`mad_${VERSION}_universal.dmg\`, open it, and drag **mad** to Applications.
           Universal — one binary for both Apple Silicon and Intel.
+          ${UPDATE_NOTE}
           ${SIGNED_NOTE}
 
           <details>

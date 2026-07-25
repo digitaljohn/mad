@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
@@ -131,9 +131,38 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let recents = app.state::<Recents>().0.lock().unwrap().clone();
     let (save_on, save_as_on) = *app.state::<MenuState>().enabled.lock().unwrap();
 
+    let item = |id: &str, label: &str, accel: Option<&str>| -> tauri::Result<MenuItem<Wry>> {
+        let mut b = MenuItemBuilder::with_id(id, label);
+        if let Some(a) = accel {
+            b = b.accelerator(a);
+        }
+        b.build(app)
+    };
+
+    // The About panel shows a generic document icon unless it is handed one
+    // explicitly — reuse the window icon, which Tauri already embedded from the
+    // bundle at build time.
+    // Not `default_window_icon()`: that returns the first entry in the bundle
+    // icon list, which is 32x32, and the About panel renders far larger than
+    // that — it looked soft. Load a proper resolution instead.
+    let about_icon =
+        tauri::image::Image::from_bytes(include_bytes!("../icons/128x128@2x.png")).ok();
+    let about = AboutMetadataBuilder::new()
+        .name(Some("mad"))
+        .version(Some(env!("CARGO_PKG_VERSION")))
+        .icon(about_icon)
+        .license(Some("MIT"))
+        .website(Some("https://github.com/digitaljohn/mad"))
+        .website_label(Some("mad on GitHub"))
+        .comments(Some(
+            "A clean markdown editor for folders full of specs, notes and documentation.",
+        ))
+        .build();
+
     // App menu (macOS conventions): about, services, hide, quit.
     let app_menu = SubmenuBuilder::new(app, "mad")
-        .about(None)
+        .about(Some(about))
+        .item(&item("check_updates", "Check for Updates…", None)?)
         .separator()
         .services()
         .separator()
@@ -143,14 +172,6 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .separator()
         .quit()
         .build()?;
-
-    let item = |id: &str, label: &str, accel: Option<&str>| -> tauri::Result<MenuItem<Wry>> {
-        let mut b = MenuItemBuilder::with_id(id, label);
-        if let Some(a) = accel {
-            b = b.accelerator(a);
-        }
-        b.build(app)
-    };
 
     let save = MenuItemBuilder::with_id("save", "Save")
         .accelerator("CmdOrCtrl+S")
@@ -1402,6 +1423,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
             app.manage(Recents(Mutex::new(load_recents(&handle))));
@@ -1418,7 +1441,7 @@ pub fn run() {
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             // Menu items that are just a named signal to the frontend.
-            const FORWARD: [(&str, &str); 18] = [
+            const FORWARD: [(&str, &str); 19] = [
                 ("open_folder", "menu-open-folder"),
                 ("new_file", "menu-new-file"),
                 ("new_folder", "menu-new-folder"),
@@ -1437,6 +1460,7 @@ pub fn run() {
                 ("toggle_sidebar", "menu-toggle-sidebar"),
                 ("toggle_theme", "menu-toggle-theme"),
                 ("show_changes", "menu-show-changes"),
+                ("check_updates", "menu-check-updates"),
             ];
             if let Some((_, ev)) = FORWARD.iter().find(|(k, _)| *k == id) {
                 let _ = app.emit(ev, ());

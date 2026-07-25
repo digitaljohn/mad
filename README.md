@@ -24,6 +24,10 @@ xattr -d com.apple.quarantine /Applications/mad.app
 
 Or build it yourself — see [Running it](#running-it).
 
+After that it keeps itself current: mad looks for a new release shortly after
+launch and offers it, or you can ask any time with **mad ▸ Check for Updates…**.
+Agree and it downloads, installs and relaunches on its own.
+
 ## Why this exists
 
 I work in a hardware team. The documentation lives in markdown — a folder of specs,

@@ -76,11 +76,65 @@ Submitting to the main `homebrew-cask` repository instead of your own tap has
 notability requirements (roughly 30+ stars/forks/watchers), so a personal tap is
 the right starting point.
 
-## What is deliberately not here
+## Self-update
 
-**Auto-update.** Tauri has `tauri-plugin-updater`, which needs its own signing
-keypair and a manifest hosted somewhere. It is worth adding once there are users
-who will not otherwise notice a new version — not before.
+The app checks quietly a few seconds after launch, and on demand from
+**mad ▸ Check for Updates…**. If there is a newer release it says which version,
+shows the notes, and on agreement downloads it with a progress readout, installs
+it and relaunches. One click.
+
+Updates are **signed with a minisign keypair** that is nothing to do with Apple —
+it exists so the app will only install a bundle that came from you. The public
+half is committed in `tauri.conf.json`; the private half is not, and must not be.
+
+### One-time setup
+
+A keypair has already been generated. The private key is at:
+
+```
+~/.config/mad-release/updater.key
+```
+
+Back it up somewhere safe — **if it is lost, existing installs can never be
+updated again**, because they will only accept bundles signed by the key whose
+public half they shipped with. Then add it as a repository secret
+(**Settings → Secrets and variables → Actions**):
+
+| Secret | Value |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | the contents of `~/.config/mad-release/updater.key` |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | empty — the key was generated without one |
+
+```bash
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.config/mad-release/updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --body ""
+```
+
+**This secret is required, not optional.** With a pubkey in the config the
+bundler *fails* rather than producing an unsigned build, so the release workflow
+checks for the key up front and stops in seconds with a pointer here, instead of
+dying several minutes into a build with a cryptic message.
+
+To generate a fresh keypair — only if you have to, since it orphans every
+existing install:
+
+```bash
+npx tauri signer generate -w ~/.config/mad-release/updater.key
+# then paste the .pub contents into src-tauri/tauri.conf.json > plugins.updater.pubkey
+```
+
+### How the app finds an update
+
+The release publishes `latest.json` next to the binaries, and the app points at
+`releases/latest/download/latest.json` — so "latest" always resolves to the newest
+manifest with nothing extra to host. One universal bundle serves every Mac, but
+the updater matches on the exact target triple, so the manifest lists
+`darwin-universal`, `darwin-aarch64` and `darwin-x86_64` all pointing at it.
+
+Self-update replaces the app in place, which means **an unsigned build stays
+unsigned** — the user allowed it once at install and is not asked again.
+
+## What is deliberately not here
 
 **Windows and Linux builds.** The app is macOS-first: the window chrome assumes
 `titleBarStyle: Overlay` with a traffic-light inset, and the menu is built with

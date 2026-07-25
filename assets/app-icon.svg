@@ -1,0 +1,27 @@
+<!--
+  Source of truth for the app icon. Regenerate the bundled icon set with:
+
+      npm run icons        (needs rsvg-convert: brew install librsvg)
+
+  Geometry notes:
+  - 1024x1024 with the rounded rect on Apple's macOS grid: 824x824 inset by
+    100, corner radius 185.4.
+  - The mark is the app's own markdown glyph, the same one the sidebar uses for
+    .md files, scaled from its 16-unit viewBox.
+  - The glyph pair spans x 3.5..13.3, so its optical centre is 8.4 rather than
+    8.0. Centring on 8.0 shifts it visibly left.
+  - No outline box around the mark: it reads at 256px but muds into a solid
+    block by 32px, which is the size that actually matters in the Dock.
+  - Mid grey, not light. Lighter backgrounds wash the clay out.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0" stop-color="#5f5e58"/><stop offset="1" stop-color="#42413c"/>
+  </linearGradient></defs>
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#bg)"/>
+  <g transform="translate(66.79999999999995,88.0) scale(53)" fill="none" stroke="#d97757"
+     stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3.5 10.25v-4.5l1.9 2.2 1.9-2.2v4.5"/>
+    <path d="M11.6 5.75v4.5m-1.7-1.8 1.7 1.8 1.7-1.8"/>
+  </g>
+</svg>

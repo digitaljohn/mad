@@ -4,6 +4,15 @@
 
 export type ToastKind = "info" | "error" | "success";
 
+/** Handle to a live toast, so long-running work can report progress in place. */
+export interface ToastHandle {
+  dismiss(): void;
+  /** Replace the message without the toast flickering out and back. */
+  setText(text: string): void;
+  /** Swap the kind, e.g. from info to error when the work fails. */
+  setKind(kind: ToastKind): void;
+}
+
 interface ToastOptions {
   kind?: ToastKind;
   /** ms before it fades; 0 keeps it until dismissed. */
@@ -28,7 +37,7 @@ function ensureHost(): HTMLElement {
   return host;
 }
 
-export function toast(message: string, opts: ToastOptions = {}) {
+export function toast(message: string, opts: ToastOptions = {}): ToastHandle {
   const { kind = "info", duration = kind === "error" ? 6000 : 3200, action } = opts;
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
@@ -68,7 +77,16 @@ export function toast(message: string, opts: ToastOptions = {}) {
   // Trigger the enter transition on the next frame.
   requestAnimationFrame(() => el.classList.add("in"));
   if (duration > 0) timer = setTimeout(dismiss, duration);
-  return dismiss;
+  return {
+    dismiss,
+    setText: (next: string) => {
+      text.textContent = next;
+    },
+    setKind: (next: ToastKind) => {
+      el.classList.remove("info", "error", "success");
+      el.classList.add(next);
+    },
+  };
 }
 
 /** Convenience wrapper: report a caught error without blocking the user. */
