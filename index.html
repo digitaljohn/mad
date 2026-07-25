@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mad</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div id="sidebar-header" data-tauri-drag-region="deep">
+          <span id="folder-name"></span>
+          <div id="sidebar-actions">
+            <button id="btn-search" class="icon-btn" title="Search in files (⌘⇧F)" aria-label="Search in files">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/></svg>
+            </button>
+            <button id="btn-new-file" class="icon-btn" title="New file (⌘N)" aria-label="New file">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5.5L9 1.5Z"/><path d="M9 1.5V5.5H13"/><path d="M8 8v4M6 10h4"/></svg>
+            </button>
+            <button id="btn-open-folder" class="icon-btn" title="Open folder (⌘O)" aria-label="Open folder">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 4a1 1 0 0 1 1-1h3.6a1 1 0 0 1 .8.4l.7 1a1 1 0 0 0 .8.4h5.1a1 1 0 0 1 1 1v6.7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4Z"/></svg>
+            </button>
+          </div>
+        </div>
+        <div id="tree" role="tree" aria-label="Files"></div>
+        <div id="search-panel" class="hidden">
+          <div id="search-head">
+            <input id="search-input" type="text" placeholder="Search in files…" spellcheck="false" aria-label="Search in files" />
+            <button id="search-close" class="icon-btn" title="Close search (Esc)" aria-label="Close search">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+            </button>
+          </div>
+          <div id="search-opts" role="group" aria-label="Search options">
+            <button class="opt-btn" data-opt="case" title="Match case" aria-pressed="false">Aa</button>
+            <button class="opt-btn" data-opt="word" title="Whole word" aria-pressed="false">ab</button>
+            <button class="opt-btn" data-opt="regex" title="Regular expression" aria-pressed="false">.*</button>
+            <span id="search-summary"></span>
+          </div>
+          <div id="search-results" role="listbox" aria-label="Search results"></div>
+        </div>
+        <div id="sidebar-empty" class="hidden">
+          <p>No folder open</p>
+          <button id="btn-open-folder-side" class="btn-primary">Open Folder</button>
+        </div>
+      </aside>
+      <div id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
+      <main id="content">
+        <header id="topbar" data-tauri-drag-region="deep">
+          <button id="btn-sidebar" class="icon-btn" title="Toggle sidebar (⌘\)" aria-label="Toggle sidebar">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M6 2.5v11"/></svg>
+          </button>
+          <div id="tabs" role="tablist" aria-label="Open files"></div>
+          <div id="topbar-right">
+            <div id="mode-toggle" class="hidden" role="group" aria-label="View mode">
+              <button data-mode="rich" class="active">Rich</button>
+              <button data-mode="source">Markdown</button>
+            </div>
+            <button id="btn-split" class="icon-btn hidden" title="Split preview (⌘⇧V)" aria-label="Toggle split preview" aria-pressed="false">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 2.5v11"/></svg>
+            </button>
+          </div>
+        </header>
+        <div id="find-bar" class="hidden" role="search">
+          <div class="find-row">
+            <input id="find-input" type="text" placeholder="Find" spellcheck="false" aria-label="Find" />
+            <button class="opt-btn" data-find-opt="case" title="Match case" aria-pressed="false">Aa</button>
+            <button class="opt-btn" data-find-opt="word" title="Whole word" aria-pressed="false">ab</button>
+            <span id="find-count" aria-live="polite"></span>
+            <div class="find-btns">
+              <button id="find-prev" class="icon-btn" title="Previous (⇧⏎)" aria-label="Previous match"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11 10 8 6l-3 4"/></svg></button>
+              <button id="find-next" class="icon-btn" title="Next (⏎)" aria-label="Next match"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 6l3 4 3-4"/></svg></button>
+              <button id="find-close" class="icon-btn" title="Close (Esc)" aria-label="Close find"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+            </div>
+          </div>
+          <div class="find-row hidden" id="replace-row">
+            <input id="replace-input" type="text" placeholder="Replace" spellcheck="false" aria-label="Replace with" />
+            <div class="find-btns">
+              <button id="replace-one" class="btn-quiet" title="Replace this match">Replace</button>
+              <button id="replace-all" class="btn-quiet" title="Replace all matches">All</button>
+            </div>
+          </div>
+        </div>
+        <div id="editor-host">
+          <div id="welcome">
+            <div class="welcome-mark">✳</div>
+            <h1>mad</h1>
+            <p>A tiny markdown editor.</p>
+            <div class="welcome-actions">
+              <button id="btn-open-folder-welcome" class="btn-primary">Open Folder</button>
+              <button id="btn-new-welcome" class="btn-quiet">New File</button>
+            </div>
+            <ul class="welcome-hints">
+              <li><kbd>⌘P</kbd> Go to file</li>
+              <li><kbd>⌘⇧P</kbd> Commands</li>
+              <li><kbd>⌘⇧F</kbd> Search in files</li>
+            </ul>
+          </div>
+          <div id="editor" class="hidden"></div>
+          <div id="image-viewer" class="hidden">
+            <img id="image-viewer-img" alt="" />
+            <div id="image-meta"></div>
+          </div>
+        </div>
+        <footer id="statusbar">
+          <span id="status-path"></span>
+          <span id="status-cursor"></span>
+          <span id="status-stats"></span>
+          <span id="save-status" class="hidden"><span class="dot"></span><span id="save-status-text"></span></span>
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,1482 @@
+import "./styles.css";
+import {
+  createBackend,
+  isTauri,
+  type GitStatus,
+  type SearchHit,
+  type SearchOptions,
+} from "./backend";
+import { FileTree, fileIcon, GIT_LABEL } from "./tree";
+import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
+import { CommandPalette } from "./palette";
+import { toast, toastError } from "./toast";
+
+const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
+  document.getElementById(id) as T;
+
+const SESSION_KEY = "mad:session";
+const IMG_RE = /\.(png|jpe?g|gif|svg|webp|bmp|avif)$/i;
+const MD_RE = /\.(md|markdown)$/i;
+/** Sentinel path for the single unsaved draft tab. */
+const DRAFT = "mad://draft";
+const TAB_DND = "application/x-mad-tab";
+
+interface Tab {
+  path: string;
+  kind: "md" | "img";
+  draft?: boolean;
+}
+
+/** Everything restored on next launch. */
+interface Session {
+  root: string | null;
+  tabs: string[];
+  active: string | null;
+  expanded: string[];
+  sidebarHidden: boolean;
+  scale: number;
+  sidebarWidth: string | null;
+}
+
+function loadSession(): Partial<Session> {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? (JSON.parse(raw) as Partial<Session>) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function init() {
+  const backend = await createBackend();
+  if (isTauri) document.body.classList.add("tauri");
+  const saved = loadSession();
+
+  const welcome = $("welcome");
+  const editorEl = $("editor");
+  const folderNameEl = $("folder-name");
+  const saveStatus = $("save-status");
+  const saveStatusText = $("save-status-text");
+  const sidebarEmpty = $("sidebar-empty");
+  const treeEl = $("tree");
+  const tabsEl = $("tabs");
+  const modeToggle = $("mode-toggle");
+  const imageViewer = $("image-viewer");
+  const imageViewerImg = $<HTMLImageElement>("image-viewer-img");
+  const imageMeta = $("image-meta");
+  const statusPath = $("status-path");
+  const statusStats = $("status-stats");
+  const statusCursor = $("status-cursor");
+
+  let rootPath: string | null = null;
+  let tabs: Tab[] = [];
+  let activePath: string | null = null;
+  /** The draft's content while it isn't the live editor document. */
+  let draftBuffer = "";
+  let saveState: SaveState = "saved";
+  /** git status per absolute path, mirrored onto tabs as well as the tree. */
+  let gitMap = new Map<string, GitStatus>();
+  let docScale = clampScale(saved.scale ?? 1);
+
+  // ------------------------------------------------------------- session
+
+  let sessionTimer: ReturnType<typeof setTimeout> | undefined;
+  const saveSession = () => {
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => {
+      const session: Session = {
+        root: rootPath,
+        tabs: tabs.filter((t) => !t.draft).map((t) => t.path),
+        active: activePath === DRAFT ? null : activePath,
+        expanded: tree.expandedDirs,
+        sidebarHidden: document.body.classList.contains("sidebar-hidden"),
+        scale: docScale,
+        sidebarWidth: sidebar.style.width || null,
+      };
+      try {
+        localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+      } catch {
+        /* private mode / quota — the session is a nicety, not a requirement */
+      }
+    }, 250);
+  };
+
+  const setSaveState = (state: SaveState) => {
+    saveState = state;
+    saveStatus.classList.remove("hidden", "saved", "edited", "saving", "unsaved");
+    saveStatus.classList.add(state);
+    saveStatusText.textContent =
+      state === "saved"
+        ? "Saved"
+        : state === "saving"
+          ? "Saving…"
+          : state === "unsaved"
+            ? "Unsaved"
+            : "Edited";
+    updateTabDirt();
+    // A completed write changes the file's git state.
+    if (state === "saved") refreshGit();
+  };
+
+  const setModeUI = (mode: EditorMode) => {
+    for (const btn of modeToggle.querySelectorAll("button")) {
+      btn.classList.toggle("active", btn.dataset.mode === mode);
+    }
+    updateStatus();
+  };
+
+  const editor = new MarkdownEditor(
+    editorEl,
+    backend,
+    setSaveState,
+    setModeUI,
+    (dir) => void tree.refreshDir(dir), // show pasted/dropped images in the tree
+    () => updateStatus(),
+  );
+
+  const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/"));
+  const baseOf = (p: string) => p.split("/").pop() ?? p;
+  const activeTab = () => tabs.find((t) => t.path === activePath) ?? null;
+
+  const tabLabel = (tab: Tab) =>
+    tab.draft
+      ? "Untitled"
+      : tab.kind === "img"
+        ? baseOf(tab.path)
+        : baseOf(tab.path).replace(MD_RE, "");
+
+  const hasUnsavedDraft = () => {
+    if (!tabs.some((t) => t.draft)) return false;
+    const content = activePath === DRAFT ? editor.getContent() : draftBuffer;
+    return content.trim().length > 0;
+  };
+
+  // Enable Save / Save As only when a markdown document (draft or file) is active.
+  const updateMenuState = () => {
+    const t = activeTab();
+    const on = !!t && t.kind === "md";
+    void backend.setMenuState(on, on);
+  };
+
+  // -------------------------------------------------------------- status bar
+
+  const nf = new Intl.NumberFormat();
+  const updateStatus = () => {
+    const t = activeTab();
+    if (!t) {
+      statusPath.textContent = "";
+      statusStats.textContent = "";
+      statusCursor.textContent = "";
+      return;
+    }
+    statusPath.textContent = t.draft
+      ? "Untitled — not saved yet"
+      : rootPath && t.path.startsWith(rootPath + "/")
+        ? t.path.slice(rootPath.length + 1)
+        : t.path;
+    statusPath.title = t.draft ? "" : t.path;
+    if (t.kind === "img") {
+      statusStats.textContent = "";
+      statusCursor.textContent = "";
+      return;
+    }
+    // Separate spans so narrow windows can drop the least important parts.
+    const s = editor.getStats();
+    statusStats.innerHTML =
+      `<span class="st-words"></span><span class="st-chars"></span><span class="st-read"></span>`;
+    statusStats.querySelector(".st-words")!.textContent =
+      `${nf.format(s.words)} word${s.words === 1 ? "" : "s"}`;
+    statusStats.querySelector(".st-chars")!.textContent =
+      `${nf.format(s.chars)} char${s.chars === 1 ? "" : "s"}`;
+    statusStats.querySelector(".st-read")!.textContent = s.readingMinutes
+      ? `${s.readingMinutes} min read`
+      : "";
+    statusCursor.textContent = s.cursor
+      ? `Ln ${s.cursor.line}, Col ${s.cursor.col}`
+      : "";
+  };
+
+  // -------------------------------------------------------------- tab strip
+
+  /** Only the active document can hold unsaved changes; reflect it live. */
+  const updateTabDirt = () => {
+    const dirty = saveState === "edited" || saveState === "unsaved";
+    for (const el of tabsEl.querySelectorAll<HTMLElement>(".tab")) {
+      el.classList.toggle("dirty", dirty && el.dataset.path === activePath);
+    }
+  };
+
+  const moveTab = (srcPath: string, destPath: string, before: boolean) => {
+    if (srcPath === destPath) return;
+    const from = tabs.findIndex((t) => t.path === srcPath);
+    if (from < 0) return;
+    const [moved] = tabs.splice(from, 1);
+    let to = tabs.findIndex((t) => t.path === destPath);
+    if (to < 0) to = tabs.length;
+    else if (!before) to += 1;
+    tabs.splice(to, 0, moved);
+    renderTabs();
+    saveSession();
+  };
+
+  const renderTabs = () => {
+    tabsEl.innerHTML = "";
+    for (const tab of tabs) {
+      const el = document.createElement("div");
+      const git = tab.draft ? undefined : gitMap.get(tab.path);
+      el.className =
+        "tab" +
+        (tab.path === activePath ? " active" : "") +
+        (tab.draft ? " draft" : "") +
+        (git ? ` git git-${git}` : "");
+      el.setAttribute("role", "tab");
+      el.setAttribute("aria-selected", String(tab.path === activePath));
+      el.dataset.path = tab.path;
+      el.draggable = true;
+      el.title = tab.draft
+        ? "Untitled (unsaved)"
+        : git
+          ? `${tab.path}\n${GIT_LABEL[git]}`
+          : tab.path;
+      el.innerHTML =
+        fileIcon(tab.draft ? "untitled.md" : tab.path) +
+        `<span class="tab-name"></span>` +
+        `<span class="tab-dot" aria-hidden="true"></span>` +
+        `<button class="tab-close" tabindex="-1">` +
+        `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>`;
+      el.querySelector(".tab-name")!.textContent = tabLabel(tab);
+      el.querySelector(".tab-close")!.setAttribute("aria-label", `Close ${tabLabel(tab)}`);
+      el.addEventListener("mousedown", (e) => {
+        if (e.button === 1) {
+          e.preventDefault();
+          void closeTab(tab.path);
+        }
+      });
+      el.addEventListener("click", (e) => {
+        if ((e.target as Element).closest(".tab-close")) return;
+        void activate(tab.path);
+      });
+      el.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        tabMenu(e.clientX, e.clientY, tab);
+      });
+      el.querySelector(".tab-close")!.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void closeTab(tab.path);
+      });
+
+      // Drag to reorder.
+      el.addEventListener("dragstart", (e) => {
+        e.dataTransfer?.setData(TAB_DND, tab.path);
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+        el.classList.add("dragging");
+      });
+      el.addEventListener("dragend", () => el.classList.remove("dragging"));
+      const edge = (e: DragEvent) => {
+        const r = el.getBoundingClientRect();
+        return e.clientX < r.left + r.width / 2;
+      };
+      el.addEventListener("dragover", (e) => {
+        if (!e.dataTransfer?.types.includes(TAB_DND)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        const before = edge(e);
+        el.classList.toggle("drop-before", before);
+        el.classList.toggle("drop-after", !before);
+      });
+      el.addEventListener("dragleave", () =>
+        el.classList.remove("drop-before", "drop-after"),
+      );
+      el.addEventListener("drop", (e) => {
+        const src = e.dataTransfer?.getData(TAB_DND);
+        el.classList.remove("drop-before", "drop-after");
+        if (!src) return;
+        e.preventDefault();
+        e.stopPropagation();
+        moveTab(src, tab.path, edge(e));
+      });
+
+      tabsEl.appendChild(el);
+    }
+    updateTabDirt();
+    tabsEl
+      .querySelector<HTMLElement>(".tab.active")
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  };
+
+  const tabMenu = (x: number, y: number, tab: Tab) => {
+    document.querySelectorAll(".context-menu").forEach((m) => m.remove());
+    const menu = document.createElement("div");
+    menu.className = "context-menu";
+    const add = (label: string, run: () => void, disabled = false) => {
+      const b = document.createElement("button");
+      b.className = "context-menu-item";
+      b.textContent = label;
+      b.disabled = disabled;
+      b.addEventListener("click", () => {
+        menu.remove();
+        run();
+      });
+      menu.appendChild(b);
+    };
+    add("Close", () => void closeTab(tab.path));
+    add(
+      "Close Others",
+      () => void closeMany(tabs.filter((t) => t.path !== tab.path).map((t) => t.path)),
+      tabs.length < 2,
+    );
+    add("Close All", () => void closeMany(tabs.map((t) => t.path)));
+    if (!tab.draft) {
+      const sep = document.createElement("div");
+      sep.className = "context-menu-sep";
+      menu.appendChild(sep);
+      add("Reveal in Finder", () => {
+        void backend.revealPath(tab.path).catch((e) => toastError("Couldn’t reveal", e));
+      });
+      add("Copy Path", () => {
+        void navigator.clipboard
+          .writeText(tab.path)
+          .then(() => toast("Path copied"))
+          .catch(() => toast("Couldn’t copy path", { kind: "error" }));
+      });
+    }
+    document.body.appendChild(menu);
+    const r = menu.getBoundingClientRect();
+    menu.style.left = `${Math.min(x, window.innerWidth - r.width - 8)}px`;
+    menu.style.top = `${Math.min(y, window.innerHeight - r.height - 8)}px`;
+    const close = (e: Event) => {
+      if (!menu.contains(e.target as Node)) {
+        menu.remove();
+        window.removeEventListener("mousedown", close, true);
+      }
+    };
+    setTimeout(() => window.addEventListener("mousedown", close, true), 0);
+  };
+
+  const showSurface = (which: "welcome" | "editor" | "image") => {
+    const isEditor = which === "editor";
+    welcome.classList.toggle("hidden", which !== "welcome");
+    editorEl.classList.toggle("hidden", !isEditor);
+    imageViewer.classList.toggle("hidden", which !== "image");
+    modeToggle.classList.toggle("hidden", !isEditor || editor.isSplit);
+    $("btn-split").classList.toggle("hidden", !isEditor);
+    if (!isEditor) saveStatus.classList.add("hidden");
+    if (which !== "editor") closeFind();
+  };
+
+  /** Make `path` the active view (its tab must already exist). */
+  const activate = async (path: string) => {
+    const tab = tabs.find((t) => t.path === path);
+    if (!tab) return;
+
+    // Re-activating the already-visible tab: just show it.
+    if (activePath === path && (tab.draft || tab.kind === "img" || editor.path === path)) {
+      showSurface(tab.kind === "img" ? "image" : "editor");
+      return;
+    }
+
+    // Preserve the unsaved draft's content before we leave it.
+    if (activePath === DRAFT && editor.isDraft) draftBuffer = editor.getContent();
+
+    if (tab.draft) {
+      if (!(await editor.openDraft(draftBuffer))) {
+        tree.select(editor.path);
+        return;
+      }
+      activePath = DRAFT;
+      showSurface("editor");
+      tree.select(null);
+      renderTabs();
+      updateMenuState();
+      updateStatus();
+      saveSession();
+      return;
+    }
+
+    if (tab.kind === "img") {
+      await editor.flush();
+      try {
+        const url = await backend.toDisplayUrl(path);
+        imageMeta.textContent = baseOf(path);
+        imageViewerImg.onload = () => {
+          imageMeta.textContent = `${baseOf(path)} · ${imageViewerImg.naturalWidth}×${imageViewerImg.naturalHeight}`;
+        };
+        imageViewerImg.src = url;
+      } catch (e) {
+        toastError("Couldn’t open image", e);
+        await closeTab(path);
+        return;
+      }
+      activePath = path;
+      showSurface("image");
+      tree.select(path);
+      renderTabs();
+      updateMenuState();
+      updateStatus();
+      saveSession();
+      return;
+    }
+
+    try {
+      if (!(await editor.openFile(path))) {
+        tree.select(editor.path); // save blocked — stay on the current file
+        return;
+      }
+    } catch (e) {
+      toastError(`Couldn’t open ${baseOf(path)}`, e);
+      await closeTab(path);
+      return;
+    }
+    activePath = path;
+    showSurface("editor");
+    tree.select(path);
+    renderTabs();
+    updateMenuState();
+    updateStatus();
+    saveSession();
+  };
+
+  /** Open a file: create its tab if needed, then activate it. */
+  const openFile = async (path: string) => {
+    if (!tabs.some((t) => t.path === path)) {
+      tabs.push({ path, kind: IMG_RE.test(path) ? "img" : "md" });
+    }
+    await activate(path);
+  };
+
+  const goWelcome = () => {
+    activePath = null;
+    showSurface("welcome");
+    tree.select(null);
+    updateMenuState();
+    updateStatus();
+    saveSession();
+  };
+
+  const closeTab = async (path: string) => {
+    const idx = tabs.findIndex((t) => t.path === path);
+    if (idx < 0) return;
+    const tab = tabs[idx];
+    if (tab.draft) {
+      const content = activePath === DRAFT ? editor.getContent() : draftBuffer;
+      if (
+        content.trim() &&
+        !(await backend.confirm(
+          "Discard unsaved file",
+          "This file has never been saved. Discard it?",
+        ))
+      ) {
+        return;
+      }
+      draftBuffer = "";
+      if (activePath === DRAFT) editor.detach();
+    }
+    const wasActive = activePath === path;
+    tabs.splice(idx, 1);
+    if (!wasActive) {
+      renderTabs();
+      saveSession();
+      return;
+    }
+    if (tabs.length === 0) {
+      await editor.flush();
+      goWelcome();
+      renderTabs();
+      return;
+    }
+    await activate(tabs[Math.min(idx, tabs.length - 1)].path);
+  };
+
+  const closeMany = async (paths: string[]) => {
+    for (const p of [...paths]) await closeTab(p);
+  };
+
+  /** Close every tab under `path` (used after a move/delete invalidates it). */
+  const closeTabsUnder = async (path: string) => {
+    const hit = (p: string) => p === path || p.startsWith(path + "/");
+    if (!tabs.some((t) => hit(t.path))) return;
+    const wasActive = activePath !== null && hit(activePath);
+    tabs = tabs.filter((t) => !hit(t.path));
+    if (wasActive) {
+      if (tabs.length) await activate(tabs[tabs.length - 1].path);
+      else goWelcome();
+    }
+    renderTabs();
+    saveSession();
+  };
+
+  /** After an on-disk rename/move of `oldPath` → `newPath`, fix open state. */
+  const remapPaths = (oldPath: string, newPath: string) => {
+    const remap = (p: string) =>
+      p === oldPath
+        ? newPath
+        : p.startsWith(oldPath + "/")
+          ? newPath + p.slice(oldPath.length)
+          : p;
+    for (const t of tabs) if (!t.draft) t.path = remap(t.path);
+    if (activePath) activePath = remap(activePath);
+    const ep = editor.path;
+    if (ep && (ep === oldPath || ep.startsWith(oldPath + "/"))) {
+      editor.adoptPath(remap(ep));
+    }
+  };
+
+  // ---------------------------------------------------------- tree callbacks
+
+  const onRename = async (oldPath: string, rawName: string) => {
+    let name = rawName.trim();
+    // Reject path separators / traversal so a rename can't relocate the file.
+    if (!name || /[/\\]/.test(name) || name === "." || name === "..") {
+      toast("A name can’t contain slashes.", { kind: "error" });
+      await tree.refreshDir(parentOf(oldPath));
+      return;
+    }
+    if (MD_RE.test(oldPath) && !MD_RE.test(name)) name += ".md";
+    const newPath = `${parentOf(oldPath)}/${name}`;
+    if (newPath === oldPath) return;
+    await editor.flush(); // no pending autosave should race the on-disk move
+    try {
+      await backend.renamePath(oldPath, newPath);
+    } catch (e) {
+      toastError("Couldn’t rename", e);
+      await tree.refreshDir(parentOf(oldPath));
+      return;
+    }
+    remapPaths(oldPath, newPath);
+    await tree.refreshDir(parentOf(oldPath));
+    await tree.reveal(newPath);
+    renderTabs();
+    updateStatus();
+    refreshGit();
+    saveSession();
+  };
+
+  const onMove = async (src: string, destDir: string) => {
+    if (parentOf(src) === destDir) return;
+    if (destDir === src || destDir.startsWith(src + "/")) return; // into itself
+    await editor.flush(); // no pending autosave should race the on-disk move
+    let newPath: string;
+    try {
+      newPath = await backend.moveInto(src, destDir);
+    } catch (e) {
+      toastError("Couldn’t move", e);
+      return;
+    }
+    remapPaths(src, newPath);
+    await tree.refreshDir(parentOf(src));
+    await tree.refreshDir(destDir);
+    await tree.reveal(newPath);
+    renderTabs();
+    updateStatus();
+    refreshGit();
+    saveSession();
+  };
+
+  const onNewFileIn = async (dir: string) => {
+    let created: string;
+    try {
+      created = await backend.createFile(dir, "Untitled.md");
+    } catch (e) {
+      toastError("Couldn’t create file", e);
+      return;
+    }
+    await tree.refreshDir(dir);
+    refreshGit();
+    await openFile(created);
+    tree.startRename(created);
+  };
+
+  const onNewFolder = async (dir: string) => {
+    if (!dir) {
+      toast("Open a folder first.", { kind: "error" });
+      return;
+    }
+    let created: string;
+    try {
+      created = await backend.createFolder(dir, "New Folder");
+    } catch (e) {
+      toastError("Couldn’t create folder", e);
+      return;
+    }
+    await tree.refreshDir(dir);
+    await tree.reveal(created);
+    tree.startRename(created);
+  };
+
+  const onDelete = async (path: string, isDir: boolean) => {
+    const ok = await backend.confirm(
+      isDir ? "Delete folder" : "Delete file",
+      `Move “${baseOf(path)}” to the Trash?${isDir ? " Everything inside it goes too." : ""}`,
+    );
+    if (!ok) return;
+    // If the open document is (under) the target, detach the editor FIRST so a
+    // later autosave can't rewrite the trashed path and resurrect the file.
+    const ep = editor.path;
+    if (ep && (ep === path || ep.startsWith(path + "/"))) editor.detach();
+    else await editor.flush(); // persist unrelated edits before touching the tree
+    try {
+      await backend.trashPath(path);
+    } catch (e) {
+      toastError("Couldn’t delete", e);
+      return;
+    }
+    await closeTabsUnder(path);
+    await tree.refreshDir(parentOf(path));
+    refreshGit();
+    toast(`Moved “${baseOf(path)}” to the Trash`);
+  };
+
+  const tree = new FileTree(treeEl, backend, {
+    onOpenFile: (p) => void openFile(p),
+    onRename: (p, n) => void onRename(p, n),
+    onMove: (s, d) => void onMove(s, d),
+    onNewFile: (d) => void onNewFileIn(d),
+    onNewFolder: (d) => void onNewFolder(d),
+    onDelete: (p, isDir) => void onDelete(p, isDir),
+    onExpandedChange: () => saveSession(),
+  });
+
+  // --------------------------------------------------------------- git state
+
+  let gitTimer: ReturnType<typeof setTimeout> | undefined;
+  let gitSeq = 0;
+  /** Signature of the last painted status, to skip no-op repaints. */
+  let gitSig = "";
+  let gitWarnedTruncated = false;
+  /** Re-read `git status` and repaint the decorations. Debounced, and cheap
+      enough to fire on every save and filesystem event. */
+  const refreshGit = () => {
+    clearTimeout(gitTimer);
+    gitTimer = setTimeout(async () => {
+      if (!rootPath) return;
+      const seq = ++gitSeq;
+      let info;
+      try {
+        info = await backend.gitStatus(rootPath);
+      } catch {
+        info = null; // git missing or the folder went away — just clear marks
+      }
+      if (seq !== gitSeq) return; // a newer refresh already landed
+      // Repainting rebuilds the tree DOM, so skip it when nothing moved —
+      // autosave and window focus both land here routinely.
+      const sig = (info?.entries ?? []).map((e) => `${e.status}:${e.path}`).join("\n");
+      if (sig === gitSig) return;
+      gitSig = sig;
+      gitMap = new Map((info?.entries ?? []).map((e) => [e.path, e.status]));
+      tree.setGit(info);
+      renderTabs();
+      if (info?.truncated && !gitWarnedTruncated) {
+        gitWarnedTruncated = true;
+        toast("Too many git changes to mark them all — showing the first 5,000.");
+      }
+    }, 300);
+  };
+
+  // ------------------------------------------------------------- folder ops
+
+  const setRoot = async (path: string, expanded: string[] = []) => {
+    rootPath = path;
+    folderNameEl.textContent = baseOf(path);
+    folderNameEl.title = path;
+    sidebarEmpty.classList.add("hidden");
+    if ($("search-panel").classList.contains("hidden")) {
+      treeEl.classList.remove("hidden");
+    }
+    if (isTauri) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      void invoke("push_recent", { path });
+    }
+    await tree.setRoot(path, expanded);
+    void backend.watchFolder(path).catch(() => {
+      /* watching is a nicety; the app works without it */
+    });
+    gitWarnedTruncated = false;
+    gitSig = "";
+    refreshGit();
+    saveSession();
+  };
+
+  const openFolder = async () => {
+    const picked = await backend.pickFolder();
+    if (picked) await setRoot(picked);
+  };
+
+  /** New File makes an *unsaved draft* — no disk file until first Save. */
+  const newDraft = async () => {
+    const existing = tabs.find((t) => t.draft);
+    if (existing) {
+      await activate(DRAFT);
+      return;
+    }
+    draftBuffer = "";
+    tabs.push({ path: DRAFT, kind: "md", draft: true });
+    await activate(DRAFT);
+    editor.focus();
+  };
+
+  const newFolderHere = () => void onNewFolder(rootPath ?? "");
+
+  /** Adopt `path` as a real file tab (after a draft's first save or Save As). */
+  const adoptSavedPath = async (fromPath: string | null, path: string) => {
+    tabs = tabs
+      .map((t) =>
+        (fromPath === null ? t.draft : t.path === fromPath)
+          ? { path, kind: "md" as const }
+          : t,
+      )
+      .filter((t, i, arr) => arr.findIndex((y) => y.path === t.path) === i);
+    activePath = path;
+    draftBuffer = "";
+    if (rootPath && path.startsWith(rootPath + "/")) {
+      await tree.refreshDir(parentOf(path));
+      await tree.reveal(path);
+    }
+    renderTabs();
+    updateMenuState();
+    updateStatus();
+    saveSession();
+  };
+
+  const save = async () => {
+    const t = activeTab();
+    if (!t || t.kind !== "md") return;
+    if (t.draft) {
+      const path = await backend.saveDialog("Untitled.md", rootPath);
+      if (!path) return;
+      try {
+        await editor.saveToPath(path);
+      } catch (e) {
+        toastError("Couldn’t save", e);
+        return;
+      }
+      await adoptSavedPath(null, path);
+    } else {
+      await editor.flush();
+    }
+  };
+
+  const saveAs = async () => {
+    const t = activeTab();
+    if (!t || t.kind !== "md") return;
+    const suggested = t.draft ? "Untitled.md" : baseOf(activePath!);
+    const path = await backend.saveDialog(suggested, rootPath);
+    if (!path) return;
+    try {
+      await editor.saveToPath(path);
+    } catch (e) {
+      toastError("Couldn’t save", e);
+      return;
+    }
+    await adoptSavedPath(t.draft ? null : activePath, path);
+  };
+
+  const exportHtml = async () => {
+    const t = activeTab();
+    if (!t || t.kind !== "md") return;
+    const stem = t.draft ? "Untitled" : baseOf(t.path).replace(MD_RE, "");
+    const dest = await backend.exportDialog(`${stem}.html`, rootPath, "html");
+    if (!dest) return;
+    try {
+      const html = await editor.toHtml(stem);
+      await backend.writeFile(dest, html, null);
+      toast(`Exported ${baseOf(dest)}`, {
+        kind: "success",
+        action: {
+          label: "Reveal",
+          run: () => void backend.revealPath(dest).catch(() => {}),
+        },
+      });
+    } catch (e) {
+      toastError("Couldn’t export", e);
+    }
+  };
+
+  $("btn-open-folder").addEventListener("click", () => void openFolder());
+  $("btn-open-folder-side").addEventListener("click", () => void openFolder());
+  $("btn-open-folder-welcome").addEventListener("click", () => void openFolder());
+  $("btn-new-welcome").addEventListener("click", () => void newDraft());
+  $("btn-new-file").addEventListener("click", () => void newDraft());
+
+  // ---------------------------------------------------------------- theme
+  const THEME_KEY = "mad:theme";
+  const applyTheme = (light: boolean) => {
+    document.documentElement.classList.toggle("light", light);
+    localStorage.setItem(THEME_KEY, light ? "light" : "dark");
+    editor.setMermaidTheme(light);
+  };
+  applyTheme(localStorage.getItem(THEME_KEY) === "light");
+  const toggleTheme = () =>
+    applyTheme(!document.documentElement.classList.contains("light"));
+
+  // ----------------------------------------------------------------- zoom
+  function clampScale(n: number) {
+    return Math.min(2, Math.max(0.7, Math.round(n * 100) / 100));
+  }
+  const applyScale = () => {
+    document.documentElement.style.setProperty("--doc-scale", String(docScale));
+  };
+  /** delta: +1 in, -1 out, 0 reset. */
+  const zoom = (delta: number) => {
+    docScale = delta === 0 ? 1 : clampScale(docScale + delta * 0.1);
+    applyScale();
+    saveSession();
+    toast(`Text size ${Math.round(docScale * 100)}%`, { duration: 1200 });
+  };
+  applyScale();
+
+  // ------------------------------------------------------------ spellcheck
+  const SPELL_KEY = "mad:spell";
+  let spellOn = localStorage.getItem(SPELL_KEY) !== "off";
+  const toggleSpellcheck = () => {
+    spellOn = !spellOn;
+    localStorage.setItem(SPELL_KEY, spellOn ? "on" : "off");
+    editor.setSpellcheck(spellOn);
+    toast(`Spell check ${spellOn ? "on" : "off"}`, { duration: 1400 });
+  };
+  editor.setSpellcheck(spellOn); // seed the editor's default (applied on mount)
+
+  const isMd = () => {
+    const t = activeTab();
+    return !!t && t.kind === "md";
+  };
+
+  // ------------------------------------------------------------- searching
+  const searchPanel = $("search-panel");
+  const searchInput = $<HTMLInputElement>("search-input");
+  const searchResults = $("search-results");
+  const searchSummary = $("search-summary");
+  let searchTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const SEARCH_OPTS_KEY = "mad:search-opts";
+  const searchOpts: SearchOptions = {
+    regex: false,
+    caseSensitive: false,
+    wholeWord: false,
+    ...(() => {
+      try {
+        return JSON.parse(localStorage.getItem(SEARCH_OPTS_KEY) ?? "{}");
+      } catch {
+        return {};
+      }
+    })(),
+  };
+  const OPT_KEYS = { case: "caseSensitive", word: "wholeWord", regex: "regex" } as const;
+  const reflectSearchOpts = () => {
+    for (const btn of searchPanel.querySelectorAll<HTMLButtonElement>("[data-opt]")) {
+      const key = OPT_KEYS[btn.dataset.opt as keyof typeof OPT_KEYS];
+      btn.classList.toggle("on", searchOpts[key]);
+      btn.setAttribute("aria-pressed", String(searchOpts[key]));
+    }
+  };
+  for (const btn of searchPanel.querySelectorAll<HTMLButtonElement>("[data-opt]")) {
+    btn.addEventListener("click", () => {
+      const key = OPT_KEYS[btn.dataset.opt as keyof typeof OPT_KEYS];
+      searchOpts[key] = !searchOpts[key];
+      localStorage.setItem(SEARCH_OPTS_KEY, JSON.stringify(searchOpts));
+      reflectSearchOpts();
+      void runSearch();
+    });
+  }
+  reflectSearchOpts();
+
+  const openSearch = () => {
+    if (!rootPath) {
+      toast("Open a folder to search in.", { kind: "error" });
+      return;
+    }
+    treeEl.classList.add("hidden");
+    sidebarEmpty.classList.add("hidden");
+    searchPanel.classList.remove("hidden");
+    document.body.classList.remove("sidebar-hidden");
+    const sel = selectionText();
+    if (sel && sel.length < 100) searchInput.value = sel;
+    searchInput.focus();
+    searchInput.select();
+    if (searchInput.value) void runSearch();
+  };
+  const closeSearch = () => {
+    searchPanel.classList.add("hidden");
+    if (rootPath) treeEl.classList.remove("hidden");
+    else sidebarEmpty.classList.remove("hidden");
+  };
+  $("btn-search").addEventListener("click", () =>
+    searchPanel.classList.contains("hidden") ? openSearch() : closeSearch(),
+  );
+  $("search-close").addEventListener("click", closeSearch);
+
+  const escapeHtml = (s: string) =>
+    s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+
+  const renderSearch = (hits: SearchHit[], query: string, truncated: boolean) => {
+    searchResults.innerHTML = "";
+    if (!query.trim()) {
+      searchSummary.textContent = "";
+      return;
+    }
+    if (hits.length === 0) {
+      searchResults.innerHTML = `<div class="search-empty">No results</div>`;
+      searchSummary.textContent = "";
+      return;
+    }
+    const files = new Set(hits.map((h) => h.rel)).size;
+    searchSummary.textContent =
+      `${hits.length}${truncated ? "+" : ""} in ${files} file${files === 1 ? "" : "s"}`;
+    let currentFile = "";
+    for (const h of hits) {
+      if (h.rel !== currentFile) {
+        currentFile = h.rel;
+        const head = document.createElement("div");
+        head.className = "search-file";
+        head.textContent = h.rel;
+        head.title = h.rel;
+        searchResults.appendChild(head);
+      }
+      const row = document.createElement("div");
+      row.className = "search-hit";
+      row.setAttribute("role", "option");
+      row.tabIndex = -1;
+      const chars = [...h.text];
+      const before = escapeHtml(chars.slice(0, h.start).join(""));
+      const match = escapeHtml(chars.slice(h.start, h.end).join(""));
+      const after = escapeHtml(chars.slice(h.end).join(""));
+      row.innerHTML = `<span class="ln">${h.line}</span><span class="tx">${before}<mark>${match}</mark>${after}</span>`;
+      row.addEventListener("click", async () => {
+        await openFile(h.path);
+        editor.revealSourceLine(h.line);
+      });
+      searchResults.appendChild(row);
+    }
+  };
+
+  let searchSeq = 0;
+  const runSearch = async () => {
+    if (!rootPath) return;
+    const q = searchInput.value;
+    if (q.trim().length < 2) {
+      searchResults.innerHTML = q.trim()
+        ? `<div class="search-empty">Keep typing…</div>`
+        : "";
+      searchSummary.textContent = "";
+      return;
+    }
+    const seq = ++searchSeq;
+    searchPanel.classList.add("busy");
+    try {
+      const res = await backend.searchFiles(rootPath, q, searchOpts);
+      if (seq === searchSeq) renderSearch(res.hits, q, res.truncated); // drop stale
+    } catch (e) {
+      if (seq === searchSeq) {
+        searchResults.innerHTML = `<div class="search-empty">${escapeHtml(
+          searchOpts.regex ? "Invalid regular expression" : String(e),
+        )}</div>`;
+      }
+    } finally {
+      if (seq === searchSeq) searchPanel.classList.remove("busy");
+    }
+  };
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => void runSearch(), 220);
+  });
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeSearch();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      searchResults.querySelector<HTMLElement>(".search-hit")?.focus();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      searchResults.querySelector<HTMLElement>(".search-hit")?.click();
+    }
+  });
+  searchResults.addEventListener("keydown", (e) => {
+    const rows = [...searchResults.querySelectorAll<HTMLElement>(".search-hit")];
+    const i = rows.indexOf(document.activeElement as HTMLElement);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      (rows[i + 1] ?? rows[0])?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (i <= 0) searchInput.focus();
+      else rows[i - 1].focus();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      rows[i]?.click();
+    } else if (e.key === "Escape") {
+      closeSearch();
+    }
+  });
+
+  // -------------------------------------------------------- command palette
+  interface Command {
+    title: string;
+    hint?: string;
+    run: () => void | Promise<void>;
+    when?: () => boolean;
+  }
+  const commands: Command[] = [
+    { title: "New File", hint: "⌘N", run: () => void newDraft() },
+    { title: "New Folder", hint: "⌘⇧N", run: () => newFolderHere() },
+    { title: "Open Folder…", hint: "⌘O", run: () => void openFolder() },
+    { title: "Save", hint: "⌘S", run: () => void save(), when: isMd },
+    { title: "Save As…", hint: "⌘⇧S", run: () => void saveAs(), when: isMd },
+    { title: "Export as HTML…", run: () => void exportHtml(), when: isMd },
+    {
+      title: "Reveal in Finder",
+      run: () => {
+        const t = activeTab();
+        if (t && !t.draft) void backend.revealPath(t.path).catch(() => {});
+        else if (rootPath) void backend.revealPath(rootPath).catch(() => {});
+      },
+    },
+    { title: "Close Tab", hint: "⌘W", run: () => activePath && void closeTab(activePath) },
+    { title: "Close All Tabs", run: () => void closeMany(tabs.map((t) => t.path)) },
+    { title: "Search in Files…", hint: "⌘⇧F", run: openSearch },
+    { title: "Find…", hint: "⌘F", run: () => openFind(false), when: isMd },
+    { title: "Find & Replace…", hint: "⌘⌥F", run: () => openFind(true), when: isMd },
+    {
+      title: "Toggle Markdown Source",
+      hint: "⌘⇧M",
+      run: () => editor.toggleMode(),
+      when: isMd,
+    },
+    { title: "Toggle Split Preview", hint: "⌘⇧V", run: () => toggleSplit(), when: isMd },
+    { title: "Toggle Sidebar", hint: "⌘\\", run: () => toggleSidebar() },
+    { title: "Toggle Light / Dark Theme", run: toggleTheme },
+    { title: "Toggle Spell Check", run: toggleSpellcheck },
+    { title: "Zoom In", hint: "⌘=", run: () => zoom(1) },
+    { title: "Zoom Out", hint: "⌘-", run: () => zoom(-1) },
+    { title: "Actual Size", hint: "⌘0", run: () => zoom(0) },
+    { title: "Bold", hint: "⌘B", run: () => editor.toggleBold(), when: isMd },
+    { title: "Italic", hint: "⌘I", run: () => editor.toggleItalic(), when: isMd },
+    { title: "Inline Code", hint: "⌘E", run: () => editor.toggleInlineCode(), when: isMd },
+    { title: "Link", run: () => editor.toggleLink(), when: isMd },
+    { title: "Quote", run: () => editor.toggleQuote(), when: isMd },
+    { title: "Bullet List", run: () => editor.toggleBulletList(), when: isMd },
+    { title: "Numbered List", run: () => editor.toggleOrderedList(), when: isMd },
+    { title: "Heading 1", run: () => editor.setHeading(1), when: isMd },
+    { title: "Heading 2", run: () => editor.setHeading(2), when: isMd },
+    { title: "Heading 3", run: () => editor.setHeading(3), when: isMd },
+  ];
+
+  const palette = new CommandPalette({
+    files: async () => {
+      if (!rootPath) return [];
+      const all = await backend.listAll(rootPath);
+      return all.map((f) => ({
+        title: baseOf(f.rel).replace(MD_RE, ""),
+        subtitle: f.rel,
+        glyph: IMG_RE.test(f.rel) ? "◧" : "≡",
+        run: () => void openFile(f.path),
+      }));
+    },
+    commands: () =>
+      commands
+        .filter((c) => (c.when ? c.when() : true))
+        .map((c) => ({ title: c.title, subtitle: c.hint, glyph: "›", run: c.run })),
+    outline: () =>
+      editor.getOutline().map((h) => ({
+        title: h.text || "(untitled heading)",
+        subtitle: "H" + h.level,
+        glyph: "#",
+        run: () => {
+          showSurface("editor");
+          editor.scrollToHeading(h.id);
+        },
+      })),
+  });
+
+  // ----------------------------------------------------------- find / replace
+  const findBar = $("find-bar");
+  const findInput = $<HTMLInputElement>("find-input");
+  const replaceInput = $<HTMLInputElement>("replace-input");
+  const findCount = $("find-count");
+  const replaceRow = $("replace-row");
+  const findOpts = { caseSensitive: false, wholeWord: false };
+
+  const selectionText = () => {
+    const s = window.getSelection()?.toString() ?? "";
+    return s.includes("\n") ? "" : s.trim();
+  };
+
+  const reflectFindOpts = () => {
+    for (const btn of findBar.querySelectorAll<HTMLButtonElement>("[data-find-opt]")) {
+      const on =
+        btn.dataset.findOpt === "case" ? findOpts.caseSensitive : findOpts.wholeWord;
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-pressed", String(on));
+    }
+  };
+  for (const btn of findBar.querySelectorAll<HTMLButtonElement>("[data-find-opt]")) {
+    btn.addEventListener("click", () => {
+      if (btn.dataset.findOpt === "case")
+        findOpts.caseSensitive = !findOpts.caseSensitive;
+      else findOpts.wholeWord = !findOpts.wholeWord;
+      reflectFindOpts();
+      doFind();
+      findInput.focus();
+    });
+  }
+  reflectFindOpts();
+
+  const showCount = (r: { count: number; index: number }) => {
+    findCount.textContent = r.count
+      ? `${r.index || "–"} / ${r.count}`
+      : findInput.value
+        ? "No results"
+        : "";
+  };
+  const doFind = () =>
+    showCount(
+      editor.find(findInput.value, { replace: replaceInput.value, ...findOpts }),
+    );
+  const openFind = (replace: boolean) => {
+    if (!isMd()) return;
+    const sel = selectionText();
+    findBar.classList.remove("hidden");
+    replaceRow.classList.toggle("hidden", !replace);
+    if (sel) findInput.value = sel;
+    findInput.focus();
+    findInput.select();
+    if (findInput.value) doFind();
+  };
+  const closeFind = () => {
+    if (findBar.classList.contains("hidden")) return;
+    findBar.classList.add("hidden");
+    editor.clearFind();
+    if (!editorEl.classList.contains("hidden")) editor.focus();
+  };
+  findInput.addEventListener("input", doFind);
+  replaceInput.addEventListener("input", doFind);
+  const findKeys = (e: KeyboardEvent, onEnter: () => void) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onEnter();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      closeFind();
+    }
+  };
+  findInput.addEventListener("keydown", (e) =>
+    findKeys(e, () => showCount(editor.findNext(!e.shiftKey))),
+  );
+  replaceInput.addEventListener("keydown", (e) =>
+    findKeys(e, () => showCount(editor.replaceOne())),
+  );
+  $("find-next").addEventListener("click", () => showCount(editor.findNext(true)));
+  $("find-prev").addEventListener("click", () => showCount(editor.findNext(false)));
+  $("find-close").addEventListener("click", closeFind);
+  $("replace-one").addEventListener("click", () => showCount(editor.replaceOne()));
+  $("replace-all").addEventListener("click", () => {
+    const n = editor.replaceAllMatches();
+    findCount.textContent = n ? `${n} replaced` : "Nothing to replace";
+  });
+
+  // Rich ⇄ Markdown toggle.
+  for (const btn of modeToggle.querySelectorAll("button")) {
+    btn.addEventListener("click", () =>
+      editor.setMode(btn.dataset.mode as EditorMode),
+    );
+  }
+
+  // Split preview toggle.
+  const btnSplit = $("btn-split");
+  const reflectSplit = () => {
+    btnSplit.classList.toggle("active", editor.isSplit);
+    btnSplit.setAttribute("aria-pressed", String(editor.isSplit));
+    modeToggle.classList.toggle("hidden", !isMd() || editor.isSplit);
+  };
+  const toggleSplit = () => {
+    if (!isMd()) return;
+    editor.toggleSplit();
+    reflectSplit();
+  };
+  btnSplit.addEventListener("click", toggleSplit);
+
+  // ------------------------------------------------------------ sidebar
+  const sidebar = $("sidebar");
+  const resizer = $("resizer");
+  const toggleSidebar = () => {
+    document.body.classList.toggle("sidebar-hidden");
+    saveSession();
+  };
+  $("btn-sidebar").addEventListener("click", toggleSidebar);
+  if (saved.sidebarWidth) sidebar.style.width = saved.sidebarWidth;
+  if (saved.sidebarHidden) document.body.classList.add("sidebar-hidden");
+
+  const startResize = (startX: number, startW: number) => {
+    resizer.classList.add("dragging");
+    document.body.style.cursor = "col-resize";
+    const onMove = (ev: MouseEvent) => {
+      const w = Math.min(480, Math.max(180, startW + (ev.clientX - startX)));
+      sidebar.style.width = `${w}px`;
+    };
+    const onUp = () => {
+      resizer.classList.remove("dragging");
+      document.body.style.cursor = "";
+      saveSession();
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  resizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    startResize(e.clientX, sidebar.getBoundingClientRect().width);
+  });
+  resizer.addEventListener("dblclick", () => {
+    sidebar.style.width = "264px";
+    saveSession();
+  });
+  resizer.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? 32 : 8;
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const w = sidebar.getBoundingClientRect().width + (e.key === "ArrowRight" ? step : -step);
+    sidebar.style.width = `${Math.min(480, Math.max(180, w))}px`;
+    saveSession();
+  });
+
+  // A drop the editor doesn't claim must never navigate the window away.
+  window.addEventListener("dragover", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => e.preventDefault());
+
+  window.addEventListener("keydown", (e) => {
+    // Escape closes the find bar from anywhere in the document.
+    if (e.key === "Escape" && !findBar.classList.contains("hidden")) {
+      closeFind();
+      return;
+    }
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod) return;
+    const code = e.code; // physical key — robust across macOS ⌥ dead-keys
+
+    // Tab switching: ⌘1…⌘9, and ⌘⌥← / ⌘⌥→ to cycle.
+    const digit = /^Digit([1-9])$/.exec(code);
+    if (digit && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      const n = Number(digit[1]);
+      const target = n === 9 ? tabs[tabs.length - 1] : tabs[n - 1];
+      if (target) void activate(target.path);
+      return;
+    }
+    if (e.altKey && (code === "ArrowLeft" || code === "ArrowRight") && tabs.length) {
+      e.preventDefault();
+      const i = tabs.findIndex((t) => t.path === activePath);
+      const next =
+        (i + (code === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      void activate(tabs[next].path);
+      return;
+    }
+
+    // Palette / find / search — also needed in the browser preview, where
+    // there's no native menu to own the accelerators.
+    if (code === "KeyP" && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      void palette.show(">");
+      return;
+    }
+    if (code === "KeyP" && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      void palette.show("");
+      return;
+    }
+    if (code === "KeyK" && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      void palette.show(">");
+      return;
+    }
+    if (code === "KeyF" && e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      openSearch();
+      return;
+    }
+    if (code === "KeyF" && e.altKey) {
+      e.preventDefault();
+      openFind(true);
+      return;
+    }
+    if (code === "KeyF" && !e.shiftKey) {
+      e.preventDefault();
+      openFind(false);
+      return;
+    }
+    if (code === "KeyW" && activePath) {
+      e.preventDefault();
+      void closeTab(activePath);
+      return;
+    }
+    if (code === "Backslash" && !e.shiftKey) {
+      e.preventDefault();
+      toggleSidebar();
+      return;
+    }
+
+    if (isTauri) return; // the native menu owns the rest
+    if (code === "Equal" || code === "Minus" || code === "Digit0") {
+      e.preventDefault();
+      zoom(code === "Equal" ? 1 : code === "Minus" ? -1 : 0);
+    } else if (code === "KeyS" && e.shiftKey) {
+      e.preventDefault();
+      void saveAs();
+    } else if (code === "KeyS") {
+      e.preventDefault();
+      void save();
+    } else if (code === "KeyN" && e.shiftKey) {
+      e.preventDefault();
+      newFolderHere();
+    } else if (code === "KeyN") {
+      e.preventDefault();
+      void newDraft();
+    } else if (code === "KeyM" && e.shiftKey) {
+      e.preventDefault();
+      if (isMd()) editor.toggleMode();
+    } else if (code === "KeyV" && e.shiftKey) {
+      e.preventDefault();
+      toggleSplit();
+    }
+  });
+  window.addEventListener("blur", () => void editor.flush());
+  // Coming back to the window is the moment to catch up on work done in a
+  // terminal — and it covers the case where the repo root sits above the open
+  // workspace, so `.git` isn't inside the watched tree.
+  window.addEventListener("focus", () => refreshGit());
+
+  if (isTauri) {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const { listen } = await import("@tauri-apps/api/event");
+    const { invoke } = await import("@tauri-apps/api/core");
+    const { openUrl } = await import("@tauri-apps/plugin-opener");
+
+    // Best-effort flush with a cap so a dead disk can't wedge the close.
+    const flushThenExit = async () => {
+      // Warn before losing an unsaved draft (drafts never autosave).
+      if (hasUnsavedDraft()) {
+        const proceed = await backend.confirm(
+          "Unsaved file",
+          "You have an unsaved file that will be lost. Quit without saving?",
+        );
+        if (!proceed) {
+          void invoke("cancel_exit"); // abort ⌘Q — keep the window open
+          return;
+        }
+      }
+      try {
+        await Promise.race([
+          editor.flush(),
+          new Promise((r) => setTimeout(r, 3000)),
+        ]);
+      } finally {
+        void invoke("confirm_exit");
+      }
+    };
+    void getCurrentWindow().onCloseRequested(async (e) => {
+      e.preventDefault();
+      await flushThenExit();
+    });
+    void listen("flush-and-exit", flushThenExit);
+
+    // Native menu items.
+    const menu: Record<string, () => void> = {
+      "menu-open-folder": () => void openFolder(),
+      "menu-new-file": () => void newDraft(),
+      "menu-new-folder": () => newFolderHere(),
+      "menu-save": () => void save(),
+      "menu-save-as": () => void saveAs(),
+      "menu-export-html": () => void exportHtml(),
+      "menu-close-tab": () => activePath && void closeTab(activePath),
+      "menu-find": () => openFind(false),
+      "menu-find-replace": () => openFind(true),
+      "menu-search-files": () => openSearch(),
+      "menu-toggle-spellcheck": () => toggleSpellcheck(),
+      "menu-quick-open": () => void palette.show(""),
+      "menu-command-palette": () => void palette.show(">"),
+      "menu-toggle-source": () => {
+        if (isMd()) editor.toggleMode();
+      },
+      "menu-toggle-split": () => toggleSplit(),
+      "menu-toggle-sidebar": () => toggleSidebar(),
+      "menu-toggle-theme": () => toggleTheme(),
+    };
+    for (const [event, run] of Object.entries(menu)) void listen(event, run);
+    void listen<number>("menu-zoom", (e) => zoom(e.payload));
+    void listen<string>("menu-open-recent", (e) => void setRoot(e.payload));
+
+    // The workspace changed underneath us (another app, a sync client, git…).
+    void listen<{ dirs: string[]; paths: string[]; bulk: boolean; git: boolean }>(
+      "fs-change",
+      (e) => {
+        if (e.payload.bulk) void tree.refreshAll();
+        else if (e.payload.dirs.length) void tree.refreshDirs(e.payload.dirs);
+        if (e.payload.paths.length) void editor.checkExternalChange();
+        refreshGit();
+      },
+    );
+
+    // External links open in the system browser, not the webview.
+    document.addEventListener(
+      "click",
+      (e) => {
+        const el = e.target instanceof Element ? e.target : null;
+        const a = el?.closest("a[href]") as HTMLAnchorElement | null;
+        if (a && /^https?:/i.test(a.href)) {
+          e.preventDefault();
+          void openUrl(a.href);
+        }
+      },
+      true,
+    );
+  }
+
+  // No folder yet: show empty-state sidebar.
+  sidebarEmpty.classList.remove("hidden");
+  updateMenuState();
+
+  // ------------------------------------------------------- restore session
+  const lastRoot = isTauri
+    ? (saved.root ?? localStorage.getItem("mad:last-folder"))
+    : "/demo";
+  if (lastRoot) {
+    try {
+      await backend.listDir(lastRoot); // still accessible?
+      await setRoot(lastRoot, saved.expanded ?? []);
+    } catch {
+      rootPath = null;
+    }
+  }
+
+  const root = rootPath;
+  if (root) {
+    const wanted = (saved.tabs ?? []).filter((p) => typeof p === "string");
+    if (wanted.length) {
+      // Drop tabs whose file has since disappeared (one cheap index read).
+      let known: Set<string>;
+      try {
+        known = new Set((await backend.listAll(root)).map((f) => f.path));
+      } catch {
+        known = new Set(wanted);
+      }
+      tabs = wanted
+        .filter((p) => (p.startsWith(root + "/") ? known.has(p) : true))
+        .map((p) => ({
+          path: p,
+          kind: IMG_RE.test(p) ? ("img" as const) : ("md" as const),
+        }));
+      renderTabs();
+      const target =
+        saved.active && tabs.some((t) => t.path === saved.active)
+          ? saved.active
+          : (tabs[0]?.path ?? null);
+      if (target) await activate(target);
+    } else if (!isTauri) {
+      await openFile("/demo/welcome.md");
+    }
+  }
+  updateStatus();
+}
+
+void init().catch((e) => {
+  console.error(e);
+  document.body.innerHTML = `<div style="padding:40px;font:14px system-ui;color:#c33">mad failed to start: ${String(e)}</div>`;
+});
