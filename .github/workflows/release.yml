@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Rehearsal: builds and uploads the artifacts to the run, publishes nothing.
+  # Only a tag publishes a release.
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the release
+
+# Same constraint as ci.yml: first-party `actions/*` only. Publishing uses the
+# `gh` CLI, which is preinstalled on the runners.
+jobs:
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    # Job level, not step level: a step's own `env:` block is not in scope for
+    # that same step's `if:` condition, so a step gated on its own env never
+    # runs. Apple signing is opt-in via these secrets and has to be gated
+    # somewhere that works.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(node -p 'require("./package.json").version')"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      - name: Check the tag matches the app version
+        # Otherwise a v0.2.0 release can ship a binary that calls itself 0.1.0.
+        run: node scripts/set-version.mjs --check "${{ steps.version.outputs.version }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Test before shipping
+        run: |
+          npx tsc --noEmit
+          npm run test:coverage
+
+      - name: Require the update signing key
+        # With an updater pubkey in tauri.conf.json the bundler *fails* without
+        # the matching private key — it does not fall back to unsigned. Better
+        # to say so in ten seconds than to die five minutes into a build.
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set."
+            echo "The updater is configured, so release builds need the signing key."
+            echo "See docs/RELEASING.md — 'Self-update'."
+            exit 1
+          fi
+          echo "signing key present"
+
+      - name: Rust toolchain with both Mac architectures
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: cargo-release-universal-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: cargo-release-universal-
+
+      # Signing is optional. With no Apple credentials configured the build
+      # still produces a working .dmg — macOS just asks the user to allow it the
+      # first time. Add the secrets and this step starts signing with no other
+      # change; see docs/RELEASING.md.
+      - name: Import the signing certificate
+        if: ${{ env.APPLE_CERTIFICATE != '' }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build
+        env:
+          # Required, not optional: see the check above.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Present only if configured; Tauri signs when it sees an identity and
+          # notarizes when it sees credentials, and skips both otherwise.
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Collect the artifacts
+        id: artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
+          mkdir -p dist-release
+          # The .dmg is what people download by hand. The .app.tar.gz and its
+          # .sig are what the in-app updater consumes — both are produced by the
+          # bundler because createUpdaterArtifacts is on, so don't roll our own.
+          find "$BUNDLE/dmg" -name '*.dmg' -exec cp {} dist-release/ \;
+          find "$BUNDLE/macos" -name '*.app.tar.gz' -exec cp {} dist-release/ \;
+          find "$BUNDLE/macos" -name '*.app.tar.gz.sig' -exec cp {} dist-release/ \;
+          cd dist-release && shasum -a 256 * > SHA256SUMS.txt
+          ls -la
+          cat SHA256SUMS.txt
+
+      - name: Write the update manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SIG_FILE="$(find dist-release -name '*.app.tar.gz.sig' | head -1)"
+          TAR_FILE="$(find dist-release -name '*.app.tar.gz' | head -1)"
+          if [ -z "$SIG_FILE" ] || [ -z "$TAR_FILE" ]; then
+            echo "::error::The build produced no signed update bundle."
+            exit 1
+          fi
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
+          URL="$BASE/$(basename "$TAR_FILE")"
+          SIG="$(cat "$SIG_FILE")"
+          NOTES="See https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"
+          # One universal bundle serves every Mac, but the updater looks the
+          # platform up by exact target triple — so list all three keys.
+          node -e '
+            const [version, notes, url, signature] = process.argv.slice(1);
+            const platform = { signature, url };
+            const manifest = {
+              version,
+              notes,
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "darwin-universal": platform,
+                "darwin-aarch64": platform,
+                "darwin-x86_64": platform,
+              },
+            };
+            require("fs").writeFileSync(
+              "dist-release/latest.json",
+              JSON.stringify(manifest, null, 2) + "\n",
+            );
+          ' "$VERSION" "$NOTES" "$URL" "$SIG"
+          cat dist-release/latest.json
+
+      - name: Report what was signed
+        run: |
+          APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/mad.app
+          echo '### Build' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          lipo -archs "$APP/Contents/MacOS/mad" 2>&1 | sed 's/^/architectures: /' \
+            >> "$GITHUB_STEP_SUMMARY" || true
+          if codesign -dv "$APP" 2>&1 | grep -q 'Authority=Developer ID'; then
+            echo "signing: Developer ID — opens without a Gatekeeper prompt" \
+              >> "$GITHUB_STEP_SUMMARY"
+            spctl -a -vvv -t install "$APP" 2>&1 | sed 's/^/gatekeeper: /' \
+              >> "$GITHUB_STEP_SUMMARY" || true
+          else
+            echo "signing: none — users must allow it once on first launch" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mad-macos-universal
+          path: dist-release/
+          retention-days: 14
+
+      - name: Publish the release
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SIGNED_NOTE=$'\n> This build is not signed with an Apple Developer ID. macOS will ask you to allow it the first time — see the install notes below.'
+          APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/mad.app
+          if codesign -dv "$APP" 2>&1 | grep -q 'Authority=Developer ID'; then
+            SIGNED_NOTE=""
+          fi
+          UPDATE_NOTE=$'\n\nAlready running mad? **mad ▸ Check for Updates…** will fetch this for you.'
+          cat > notes.md <<EOF
+          ## Install
+
+          Download \`mad_${VERSION}_universal.dmg\`, open it, and drag **mad** to Applications.
+          Universal — one binary for both Apple Silicon and Intel.
+          ${UPDATE_NOTE}
+          ${SIGNED_NOTE}
+
+          <details>
+          <summary>If macOS says it cannot check the app for malicious software</summary>
+
+          That is Gatekeeper reacting to an unsigned download, not a problem with
+          the app. Either:
+
+          - open **System Settings → Privacy & Security**, scroll down, and click
+            **Open Anyway**, or
+          - remove the download quarantine yourself:
+            \`\`\`bash
+            xattr -d com.apple.quarantine /Applications/mad.app
+            \`\`\`
+          </details>
+
+          Checksums are in \`SHA256SUMS.txt\`.
+          EOF
+          gh release create "v${VERSION}" dist-release/* \
+            --title "mad ${VERSION}" \
+            --notes-file notes.md \
+            --verify-tag

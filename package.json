@@ -14,7 +14,10 @@
     "test:coverage": "vitest run --coverage",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "lint": "tsc --noEmit && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
-    "check": "npm run lint && npm run test:coverage && npm run test:rust"
+    "check": "npm run lint && npm run test:coverage && npm run test:rust",
+    "version:set": "node scripts/set-version.mjs",
+    "version:check": "node scripts/set-version.mjs --check",
+    "icons": "rsvg-convert -w 1024 -h 1024 assets/app-icon.svg -o /tmp/mad-icon-1024.png && tauri icon /tmp/mad-icon-1024.png && rm -rf src-tauri/icons/android src-tauri/icons/ios"
   },
   "dependencies": {
     "@leeoniya/ufuzzy": "^1.0.19",
@@ -22,6 +25,8 @@
     "@milkdown/kit": "^7.21.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "mermaid": "^11.16.0",
     "prosemirror-search": "^1.1.1"
   },

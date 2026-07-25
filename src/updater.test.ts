@@ -1,0 +1,167 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  checkForUpdates,
+  formatBytes,
+  progressLine,
+  resetUpdaterState,
+  shortNotes,
+} from "./updater";
+
+const toasts = () =>
+  [...document.querySelectorAll(".toast:not(.leaving) .toast-text")].map(
+    (t) => t.textContent,
+  );
+const liveToasts = () => document.querySelectorAll(".toast:not(.leaving)");
+
+// The plugins only exist inside the app, so stand in for them. `checkForUpdates`
+// imports them dynamically, which is what makes this mockable at all.
+const check = vi.fn();
+const relaunch = vi.fn(async () => {});
+vi.mock("@tauri-apps/plugin-updater", () => ({ check: () => check() }));
+vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: () => relaunch() }));
+
+type Confirm = (t: string, m: string, ok: string, cancel: string) => Promise<boolean>;
+const yes = { confirm: vi.fn<Confirm>(async () => true) };
+const no = { confirm: vi.fn<Confirm>(async () => false) };
+
+beforeEach(() => {
+  resetUpdaterState();
+  check.mockReset();
+  relaunch.mockClear();
+  yes.confirm.mockClear();
+  no.confirm.mockClear();
+});
+
+describe("formatBytes", () => {
+  it("scales the unit to the size", () => {
+    expect(formatBytes(512)).toBe("512 B");
+    expect(formatBytes(4096)).toBe("4 KB");
+    expect(formatBytes(13_400_000)).toBe("12.8 MB");
+  });
+
+  it("does not report 0.0 MB for something under a megabyte", () => {
+    expect(formatBytes(900_000)).toMatch(/KB$/);
+  });
+});
+
+describe("progressLine", () => {
+  it("shows a percentage once the total is known", () => {
+    expect(progressLine(5_000_000, 10_000_000)).toBe(
+      "Downloading update… 50% of 9.5 MB",
+    );
+  });
+
+  it("falls back to bytes when the server sent no length", () => {
+    expect(progressLine(2048, null)).toBe("Downloading update… 2 KB");
+  });
+
+  it("never exceeds 100%, even if the chunks overshoot", () => {
+    expect(progressLine(11_000_000, 10_000_000)).toContain("100%");
+  });
+});
+
+describe("shortNotes", () => {
+  it("passes short notes through, trimmed", () => {
+    expect(shortNotes("  Fixed a thing.  ")).toBe("Fixed a thing.");
+  });
+
+  it("truncates long notes so a dialog stays a dialog", () => {
+    const long = "x".repeat(900);
+    const out = shortNotes(long);
+    expect(out.length).toBeLessThan(420);
+    expect(out.endsWith("…")).toBe(true);
+  });
+
+  it("copes with no notes at all", () => {
+    expect(shortNotes(undefined)).toBe("");
+  });
+});
+
+describe("checkForUpdates", () => {
+  it("says so when already up to date", async () => {
+    check.mockResolvedValue(null);
+    await checkForUpdates(yes);
+    expect(toasts()).toContain("mad is up to date");
+    expect(yes.confirm).not.toHaveBeenCalled();
+  });
+
+  it("stays quiet when up to date and asked to be silent", async () => {
+    check.mockResolvedValue(null);
+    await checkForUpdates(yes, { silent: true });
+    expect(toasts()).toEqual([]);
+  });
+
+  it("asks before downloading, and does nothing if declined", async () => {
+    const downloadAndInstall = vi.fn();
+    check.mockResolvedValue({ version: "0.3.0", body: "Notes", downloadAndInstall });
+    await checkForUpdates(no);
+    expect(no.confirm).toHaveBeenCalledOnce();
+    expect(no.confirm.mock.calls[0][0]).toContain("0.3.0");
+    expect(downloadAndInstall).not.toHaveBeenCalled();
+    expect(relaunch).not.toHaveBeenCalled();
+  });
+
+  it("downloads, reports progress, then relaunches", async () => {
+    const downloadAndInstall = vi.fn(async (onEvent) => {
+      onEvent({ event: "Started", data: { contentLength: 10_000_000 } });
+      onEvent({ event: "Progress", data: { chunkLength: 2_500_000 } });
+      onEvent({ event: "Progress", data: { chunkLength: 2_500_000 } });
+      onEvent({ event: "Finished", data: {} });
+    });
+    check.mockResolvedValue({ version: "0.3.0", body: "", downloadAndInstall });
+
+    await checkForUpdates(yes);
+
+    expect(downloadAndInstall).toHaveBeenCalledOnce();
+    // The progress toast is reused, not recreated per chunk.
+    expect(liveToasts()).toHaveLength(1);
+    expect(toasts()[0]).toBe("Restarting…");
+    expect(relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("copes with a download that never reports a length", async () => {
+    const downloadAndInstall = vi.fn(async (onEvent) => {
+      onEvent({ event: "Started", data: {} });
+      onEvent({ event: "Progress", data: { chunkLength: 1024 } });
+      onEvent({ event: "Finished", data: {} });
+    });
+    check.mockResolvedValue({ version: "0.3.0", downloadAndInstall });
+    await checkForUpdates(yes);
+    expect(relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("reports a failed check, but only when not silent", async () => {
+    check.mockRejectedValue(new Error("network down"));
+    await checkForUpdates(yes, { silent: true });
+    expect(toasts()).toEqual([]);
+
+    await checkForUpdates(yes);
+    expect(toasts().some((t) => t?.includes("network down"))).toBe(true);
+  });
+
+  it("does not leave the checking toast on screen after a failure", async () => {
+    check.mockRejectedValue(new Error("boom"));
+    await checkForUpdates(yes);
+    expect(toasts()).not.toContain("Checking for updates…");
+  });
+
+  it("ignores a second check while one is in flight", async () => {
+    let release!: () => void;
+    check.mockImplementation(() => new Promise((r) => (release = () => r(null))));
+    const first = checkForUpdates(yes);
+    // `check` is reached only after a dynamic import resolves, so wait for it
+    // before trying to release it.
+    await vi.waitFor(() => expect(check).toHaveBeenCalled());
+    await checkForUpdates(yes); // must be a no-op, not a second check
+    release();
+    await first;
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it("becomes available again after finishing", async () => {
+    check.mockResolvedValue(null);
+    await checkForUpdates(yes);
+    await checkForUpdates(yes);
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+});

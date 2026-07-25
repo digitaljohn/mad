@@ -29,6 +29,7 @@ import {
 import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
 import { CommandPalette, ICON_COMMAND, ICON_HEADING } from "./palette";
 import { toast, toastError } from "./toast";
+import { checkForUpdates } from "./updater";
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
@@ -716,6 +717,14 @@ async function init() {
     if (diffPath) void discardChanges(diffPath);
   });
 
+  // --------------------------------------------------------------- updates
+
+  const runUpdateCheck = (silent: boolean) =>
+    void checkForUpdates(
+      { confirm: (t, m, ok, cancel) => backend.confirmChoice(t, m, ok, cancel) },
+      { silent },
+    );
+
   // --------------------------------------------------------------- git state
 
   let gitTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1127,6 +1136,7 @@ async function init() {
     },
     { title: "Toggle Split Preview", hint: "⌘⇧V", run: () => toggleSplit(), when: isMd },
     { title: "Toggle Sidebar", hint: "⌘\\", run: () => toggleSidebar() },
+    { title: "Check for Updates…", run: () => runUpdateCheck(false) },
     { title: "Toggle Light / Dark Theme", run: toggleTheme },
     { title: "Toggle Spell Check", run: toggleSpellcheck },
     { title: "Zoom In", hint: "⌘=", run: () => zoom(1) },
@@ -1501,6 +1511,7 @@ async function init() {
       "menu-toggle-sidebar": () => toggleSidebar(),
       "menu-toggle-theme": () => toggleTheme(),
       "menu-show-changes": () => activePath && void showDiff(activePath),
+      "menu-check-updates": () => runUpdateCheck(false),
     };
     for (const [event, run] of Object.entries(menu)) void listen(event, run);
     void listen<number>("menu-zoom", (e) => zoom(e.payload));
@@ -1516,6 +1527,10 @@ async function init() {
         refreshGit();
       },
     );
+
+    // A quiet look for a newer release once the app has settled. Silent, so a
+    // missing manifest or no network never interrupts anyone.
+    setTimeout(() => runUpdateCheck(true), 4000);
 
     // External links open in the system browser, not the webview.
     document.addEventListener(
