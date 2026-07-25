@@ -217,9 +217,9 @@ reading a markdown serializer's source code. Both readings are supported.
 
 ## Licence
 
-Free and open source, and it is staying that way. There is no pro tier, no seat
-pricing, no "mad for Teams", and nobody will ever email you to ask how your trial
-is going. It's a markdown editor.
+[MIT](LICENSE). Free and open source, and it is staying that way. There is no pro
+tier, no seat pricing, no "mad for Teams", and nobody will ever email you to ask
+how your trial is going. It's a markdown editor.
 
 ---
 
