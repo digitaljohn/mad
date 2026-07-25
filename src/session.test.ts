@@ -4,9 +4,11 @@ import {
   MIN_SCALE,
   SESSION_KEY,
   clampScale,
+  clearSession,
   loadSession,
   parseSession,
   saveSession,
+  sessionKey,
   usableTabs,
   type Session,
 } from "./session";
@@ -196,6 +198,46 @@ describe("real localStorage", () => {
       throw new TypeError("circular");
     });
     expect(() => saveSession(localStorage, parseSession({}))).not.toThrow();
+    spy.mockRestore();
+  });
+});
+
+describe("per-window sessions", () => {
+  it("keeps the bare key for the first window, so old sessions still restore", () => {
+    expect(sessionKey("main")).toBe(SESSION_KEY);
+  });
+
+  it("gives every other window its own key", () => {
+    expect(sessionKey("mad-2")).toBe(`${SESSION_KEY}:mad-2`);
+    expect(sessionKey("mad-3")).not.toBe(sessionKey("mad-2"));
+  });
+
+  it("does not let two windows overwrite each other's tabs", () => {
+    // The bug this prevents: one shared key, last writer wins, and window A's
+    // tab list vanishes every time window B autosaves its session.
+    const a = parseSession({ root: "/a", tabs: ["/a/one.md"] });
+    const b = parseSession({ root: "/b", tabs: ["/b/two.md"] });
+    saveSession(localStorage, a, sessionKey("main"));
+    saveSession(localStorage, b, sessionKey("mad-2"));
+
+    expect(loadSession(localStorage, sessionKey("main"))).toEqual(a);
+    expect(loadSession(localStorage, sessionKey("mad-2"))).toEqual(b);
+  });
+
+  it("forgets a closed window's session instead of accumulating dead keys", () => {
+    const key = sessionKey("mad-2");
+    saveSession(localStorage, parseSession({ root: "/b" }), key);
+    clearSession(localStorage, key);
+    expect(localStorage.getItem(key)).toBe(null);
+    // An absent session is a fresh window, not a crash.
+    expect(loadSession(localStorage, key)).toEqual(parseSession({}));
+  });
+
+  it("survives storage refusing to remove a key", () => {
+    const spy = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("denied");
+    });
+    expect(() => clearSession(localStorage, sessionKey("mad-2"))).not.toThrow();
     spy.mockRestore();
   });
 });
