@@ -59,7 +59,7 @@ jobs:
       - name: Build the bundle
         run: npm run build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: frontend-coverage
@@ -149,7 +149,7 @@ jobs:
             echo 'not counted as testable. See CONTRIBUTING.md._'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: rust-coverage
