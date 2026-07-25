@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
@@ -2121,8 +2121,26 @@ struct ExitFlow(Arc<ExitFlowState>);
 #[derive(Default)]
 struct ExitFlowState {
     generation: AtomicUsize,
+    /// Is a quit actually being asked about right now? Without this, the
+    /// `confirmed` set outlives the attempt that filled it, and merely
+    /// *closing* a window later satisfies "everyone agreed" — quitting the
+    /// app and taking another window's unsaved draft with it.
+    in_flight: AtomicBool,
     acked: Mutex<HashSet<String>>,
     confirmed: Mutex<HashSet<String>>,
+}
+
+impl ExitFlowState {
+    /// Abandon the current attempt. A window that declines cancels the quit
+    /// for everyone, which is what declining has always meant.
+    fn stand_down(&self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+        self.acked.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.confirmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }
 
 /// Should the exit backstop force-quit? Only when its own attempt is still
@@ -2150,6 +2168,11 @@ fn everyone_confirmed(confirmed: &HashSet<String>, open: &[String]) -> bool {
 #[tauri::command]
 fn confirm_exit(app: tauri::AppHandle, window: tauri::Window) {
     let st = app.state::<ExitFlow>().0.clone();
+    // Only meaningful while a quit is being asked about. A late answer from
+    // an abandoned attempt must not accumulate towards a future exit.
+    if !st.in_flight.load(Ordering::SeqCst) {
+        return;
+    }
     let open: Vec<String> = app.webview_windows().into_keys().collect();
     let done = {
         let mut confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
@@ -2159,6 +2182,14 @@ fn confirm_exit(app: tauri::AppHandle, window: tauri::Window) {
     if done {
         app.exit(0);
     }
+}
+
+/// A window declined the quit (an unsaved draft it wants to keep). One "no"
+/// cancels the attempt for everyone, and — crucially — clears the tally, so
+/// nothing left over can quit the app later.
+#[tauri::command]
+fn exit_declined(app: tauri::AppHandle) {
+    app.state::<ExitFlow>().0.stand_down();
 }
 
 /// First thing a window calls on `flush-and-exit`: proves the webview is
@@ -2355,7 +2386,8 @@ pub fn run() {
             watch_folder,
             new_window,
             confirm_exit,
-            exit_ack
+            exit_ack,
+            exit_declined
         ])
         .on_window_event(|window, event| {
             let app = window.app_handle();
@@ -2382,10 +2414,13 @@ pub fn run() {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&label);
                     // A window closing during ⌘Q can be the last answer the
-                    // quit was waiting on — re-check rather than hang.
+                    // quit was waiting on — re-check rather than hang. Only
+                    // while a quit is genuinely in flight: otherwise simply
+                    // closing a window would satisfy a stale tally and take
+                    // the whole app (and another window's draft) with it.
                     let st = app.state::<ExitFlow>().0.clone();
                     let open: Vec<String> = app.webview_windows().into_keys().collect();
-                    let done = {
+                    let done = st.in_flight.load(Ordering::SeqCst) && {
                         let confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
                         !confirmed.is_empty() && everyone_confirmed(&confirmed, &open)
                     };
@@ -2410,13 +2445,10 @@ pub fn run() {
                     api.prevent_exit();
                     let st = app.state::<ExitFlow>().0.clone();
                     let gen = st.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                    st.acked.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                    st.confirmed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clear();
-                    // Every window flushes its own document and answers; the
-                    // app exits when the last one agrees.
+                    st.stand_down(); // clear any previous attempt's tally…
+                    st.in_flight.store(true, Ordering::SeqCst); // …then open this one
+                                                                // Every window flushes its own document and answers; the
+                                                                // app exits when the last one agrees.
                     let _ = app.emit("flush-and-exit", ());
                     // Backstop for webviews that never answer at all (dead,
                     // hung, or not yet loaded — no user edits can exist then).
@@ -3632,6 +3664,49 @@ mod tests {
         // would let a stale confirmed-set exit the app at the wrong moment.
         let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
         assert!(!everyone_confirmed(&confirmed, &[]));
+    }
+
+    #[test]
+    fn an_abandoned_quit_cannot_quit_the_app_later() {
+        // The bug: ⌘Q, window A agrees, window B declines. A's agreement sat
+        // in `confirmed` forever. Later the user merely CLOSES window A — the
+        // Destroyed handler saw "everyone still open has agreed" and exited
+        // the app, taking window B's unsaved draft with it.
+        let st = ExitFlowState::default();
+
+        // A quit opens, window A agrees, window B declines.
+        st.in_flight.store(true, Ordering::SeqCst);
+        st.confirmed.lock().unwrap().insert("main".to_string());
+        st.stand_down();
+
+        assert!(
+            !st.in_flight.load(Ordering::SeqCst),
+            "declining must close the attempt"
+        );
+        assert!(
+            st.confirmed.lock().unwrap().is_empty(),
+            "the tally must not outlive the attempt it belonged to"
+        );
+
+        // Which is what the Destroyed handler now keys on: no attempt open,
+        // so closing a window is just closing a window.
+        assert!(!st.in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_fresh_quit_starts_from_an_empty_tally() {
+        let st = ExitFlowState::default();
+        st.in_flight.store(true, Ordering::SeqCst);
+        st.acked.lock().unwrap().insert("mad-2".to_string());
+        st.confirmed.lock().unwrap().insert("mad-2".to_string());
+
+        // What ExitRequested does: clear, then open.
+        st.stand_down();
+        st.in_flight.store(true, Ordering::SeqCst);
+
+        assert!(st.acked.lock().unwrap().is_empty());
+        assert!(st.confirmed.lock().unwrap().is_empty());
+        assert!(st.in_flight.load(Ordering::SeqCst));
     }
 
     #[test]
