@@ -6,9 +6,9 @@ import {
   displayName,
   escapeHtml,
   escapeRe,
-  isImage,
-  isMarkdown,
+  IMG_RE,
   isUnder,
+  MD_RE,
   normalize,
   normalizeTrailer,
   parentOf,
@@ -19,19 +19,19 @@ import {
 
 describe("file type tests", () => {
   it("recognises markdown and images case-insensitively", () => {
-    expect(isMarkdown("a.md")).toBe(true);
-    expect(isMarkdown("a.MARKDOWN")).toBe(true);
-    expect(isMarkdown("a.mdx")).toBe(false);
-    expect(isMarkdown("md")).toBe(false);
-    expect(isImage("p.PNG")).toBe(true);
-    expect(isImage("p.jpeg")).toBe(true);
-    expect(isImage("p.svg")).toBe(true);
-    expect(isImage("p.psd")).toBe(false);
+    expect(MD_RE.test("a.md")).toBe(true);
+    expect(MD_RE.test("a.MARKDOWN")).toBe(true);
+    expect(MD_RE.test("a.mdx")).toBe(false);
+    expect(MD_RE.test("md")).toBe(false);
+    expect(IMG_RE.test("p.PNG")).toBe(true);
+    expect(IMG_RE.test("p.jpeg")).toBe(true);
+    expect(IMG_RE.test("p.svg")).toBe(true);
+    expect(IMG_RE.test("p.psd")).toBe(false);
   });
 
   it("does not mistake an extension inside the name for the extension", () => {
-    expect(isMarkdown("notes.md.bak")).toBe(false);
-    expect(isImage("png.txt")).toBe(false);
+    expect(MD_RE.test("notes.md.bak")).toBe(false);
+    expect(IMG_RE.test("png.txt")).toBe(false);
   });
 });
 

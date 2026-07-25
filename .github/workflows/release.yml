@@ -10,6 +10,12 @@ on:
 permissions:
   contents: write # required to create the release
 
+# Two tags pushed in quick succession must not race each other into
+# `gh release create`. Never cancel a release mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 # Same constraint as ci.yml: first-party `actions/*` only. Publishing uses the
 # `gh` CLI, which is preinstalled on the runners.
 jobs:
@@ -77,22 +83,57 @@ jobs:
           key: cargo-release-universal-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: cargo-release-universal-
 
+      - name: Test the Rust side before shipping
+        # The Rust half owns every filesystem operation — the one thing a
+        # release must not ship unverified. After the cache step, so the
+        # dependency build here warms the same cache the bundle build uses.
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Detect Apple signing credentials
         id: apple
-        # Note what this deliberately does NOT do: define APPLE_CERTIFICATE for
-        # later steps. Tauri runs `security import` itself whenever it sees that
-        # variable, and GitHub sets an absent secret to the empty string rather
-        # than omitting it — so merely mentioning it in a shared env block makes
-        # the bundler try to import an empty certificate and fail.
+        # All six secrets or none. A partial set is the worst of both worlds:
+        # with the certificate but no notarization account the build dies
+        # ~6 minutes in; with the account but no certificate it silently
+        # ships unsigned while looking configured.
+        #
+        # Note what this deliberately does NOT do: define APPLE_CERTIFICATE
+        # for later steps. Tauri runs `security import` itself whenever it
+        # sees that variable, and GitHub sets an absent secret to the empty
+        # string rather than omitting it — so merely mentioning it in a shared
+        # env block makes the bundler try to import an empty certificate and
+        # fail. The local names here (CERT, …) keep that from happening.
         env:
           CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PW: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENT: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          AID: ${{ secrets.APPLE_ID }}
+          APW: ${{ secrets.APPLE_PASSWORD }}
+          TEAM: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$CERT" ]; then
+          present=0; missing=""
+          for pair in CERT:APPLE_CERTIFICATE CERT_PW:APPLE_CERTIFICATE_PASSWORD \
+                      IDENT:APPLE_SIGNING_IDENTITY AID:APPLE_ID \
+                      APW:APPLE_PASSWORD TEAM:APPLE_TEAM_ID; do
+            var="${pair%%:*}"; label="${pair#*:}"
+            if [ -n "${!var}" ]; then
+              present=$((present+1))
+            else
+              missing="$missing $label"
+            fi
+          done
+          if [ "$present" -eq 6 ]; then
             echo "signing=true" >> "$GITHUB_OUTPUT"
-            echo "Apple credentials found — the build will be signed and notarized."
-          else
+            echo "All six Apple secrets present — the build will be signed and notarized."
+          elif [ "$present" -eq 0 ]; then
             echo "signing=false" >> "$GITHUB_OUTPUT"
             echo "No Apple credentials — building unsigned (users allow it once)."
+          else
+            echo "::error::Apple signing is half-configured ($present of 6 secrets set). Missing:$missing"
+            echo "Set all six secrets, or none for an unsigned build. See docs/RELEASING.md."
+            exit 1
           fi
 
       # Two builds, one of which runs. Tauri imports the certificate and
@@ -121,8 +162,6 @@ jobs:
 
       - name: Collect the artifacts
         id: artifacts
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           BUNDLE=src-tauri/target/universal-apple-darwin/release/bundle
           mkdir -p dist-release
@@ -132,9 +171,7 @@ jobs:
           find "$BUNDLE/dmg" -name '*.dmg' -exec cp {} dist-release/ \;
           find "$BUNDLE/macos" -name '*.app.tar.gz' -exec cp {} dist-release/ \;
           find "$BUNDLE/macos" -name '*.app.tar.gz.sig' -exec cp {} dist-release/ \;
-          cd dist-release && shasum -a 256 * > SHA256SUMS.txt
-          ls -la
-          cat SHA256SUMS.txt
+          ls -la dist-release
 
       - name: Write the update manifest
         env:
@@ -172,6 +209,13 @@ jobs:
           ' "$VERSION" "$NOTES" "$URL" "$SIG"
           cat dist-release/latest.json
 
+      - name: Checksum everything, manifest included
+        # After the manifest is written — the one file the updater actually
+        # fetches must not be the one file with no published checksum.
+        run: |
+          cd dist-release && shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Report what was signed
         run: |
           APP=src-tauri/target/universal-apple-darwin/release/bundle/macos/mad.app
@@ -197,6 +241,7 @@ jobs:
           retention-days: 14
 
       - name: Publish the release
+        id: publish
         if: ${{ github.ref_type == 'tag' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -232,7 +277,24 @@ jobs:
 
           Checksums are in \`SHA256SUMS.txt\`.
           EOF
-          gh release create "v${VERSION}" dist-release/* \
+          # A retry after a half-finished publish must not die on "release
+          # already exists" — fall back to (re)uploading the assets into it.
+          if ! gh release create "v${VERSION}" dist-release/* \
             --title "mad ${VERSION}" \
             --notes-file notes.md \
-            --verify-tag
+            --verify-tag; then
+            echo "Release exists (or create failed) — uploading assets into it."
+            gh release upload "v${VERSION}" dist-release/* --clobber
+          fi
+
+      - name: Remove a partial release on failure
+        # A release missing assets is worse than none: `latest` resolves to it
+        # and the updater 404s. Delete the release (never the tag) so a plain
+        # re-run of this workflow can publish cleanly. Scoped to failures of
+        # the publish step itself — a re-run of an already-published tag that
+        # dies in an earlier step must NOT take the good release down.
+        if: ${{ failure() && github.ref_type == 'tag' && steps.publish.outcome == 'failure' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release delete "v${VERSION}" --yes || true

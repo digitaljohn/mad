@@ -179,19 +179,20 @@ Nor does it lose work:
 
 | | |
 | --- | --- |
-| `⌘P` / `⌘⇧P` | Go to file / command palette |
+| `⌘P` / `⌘⇧P` (or `⌘K`) | Go to file / command palette |
+| `⌘⇧O` | Go to heading in this document |
 | `⌘N` / `⌘⇧N` | New file / new folder |
 | `⌘O` | Open folder |
 | `⌘S` / `⌘⇧S` | Save / Save As |
-| `⌘W` | Close tab |
+| `⌘W` / `⌘⇧W` | Close tab / close window |
 | `⌘1`…`⌘9`, `⌘⌥←/→` | Switch tabs |
 | `⌘F` / `⌘⌥F` / `⌘⇧F` | Find / find & replace / find in files |
 | `⌘⇧M` / `⌘⇧V` | Toggle markdown source / split preview |
 | `⌘⇧D` | Show changes for this document |
 | `⌘\` | Toggle sidebar |
 | `⌘=` / `⌘-` / `⌘0` | Zoom in / out / actual size |
-| `⌘B` `⌘I` `⌘E` | Bold / italic / inline code |
-| `F2`, `⌫` | Rename / delete in the tree |
+| `⌘B` `⌘I` `⌘E` | Bold / italic / inline code (in the rich editor) |
+| `F2`, `⌘⌫` | Rename / delete in the tree |
 
 ## Running it
 
@@ -205,15 +206,15 @@ in-memory demo workspace — no Rust, no Tauri, no waiting. Most of the styling 
 done that way, and it's how the screenshots above were taken.
 
 ```bash
-npm test              # 273 frontend unit tests (Vitest + jsdom)
-npm run test:rust     # 54 Rust tests, several against real git repositories
-npm run check         # everything CI runs: types, both suites, coverage, clippy
+npm test              # the frontend unit tests (Vitest + jsdom)
+npm run test:rust     # the Rust tests, several against real git repositories
+npm run check         # everything CI runs: types, fmt, both suites, coverage, clippy
 npm run tauri build
 ```
 
 Releases are cut by tagging; see [docs/RELEASING.md](docs/RELEASING.md).
 
-Every pull request runs the lot on CI, plus a release build. Coverage of the
+CI runs the lot for every pull request, plus a release build. Coverage of the
 tested frontend modules is enforced at 100% statements/functions/lines — see
 [CONTRIBUTING.md](CONTRIBUTING.md) for what that does and doesn't include.
 

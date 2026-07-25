@@ -123,11 +123,28 @@ describe("checkForUpdates", () => {
     const downloadAndInstall = vi.fn(async (onEvent) => {
       onEvent({ event: "Started", data: {} });
       onEvent({ event: "Progress", data: { chunkLength: 1024 } });
-      onEvent({ event: "Finished", data: {} });
+      onEvent({ event: "Progress", data: {} }); // a chunk event with no size
+      onEvent({ event: "Finished" }); // Finished carries no data at all
     });
     check.mockResolvedValue({ version: "0.3.0", downloadAndInstall });
     await checkForUpdates(yes);
     expect(relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a second Update click while the download runs", async () => {
+    let release!: () => void;
+    const downloadAndInstall = vi.fn(
+      () => new Promise<void>((r) => (release = () => r())),
+    );
+    check.mockResolvedValue({ version: "0.3.0", body: "", downloadAndInstall });
+    await checkForUpdates(yes, { silent: true });
+
+    const action = document.querySelector<HTMLButtonElement>(".toast-action")!;
+    action.click();
+    action.click(); // double-click must not start a second download
+    await vi.waitFor(() => expect(downloadAndInstall).toHaveBeenCalled());
+    expect(downloadAndInstall).toHaveBeenCalledOnce();
+    release();
   });
 
   it("reports a failed check, but only when not silent", async () => {
@@ -162,16 +179,28 @@ describe("checkForUpdates", () => {
     expect(relaunch).not.toHaveBeenCalled();
   });
 
-  it("reports a failed download even when the check was silent", async () => {
-    const downloadAndInstall = vi.fn(async () => {
-      throw new Error("disk full");
-    });
+  it("offers a silent-check update as a toast, never a modal", async () => {
+    const downloadAndInstall = vi.fn(async () => {});
     check.mockResolvedValue({ version: "0.3.0", body: "", downloadAndInstall });
 
     await checkForUpdates(yes, { silent: true });
 
-    // The user explicitly said yes to this download; its failure is theirs to know.
-    expect(toasts().some((t) => t?.includes("disk full"))).toBe(true);
+    // No dialog four seconds into the session…
+    expect(yes.confirm).not.toHaveBeenCalled();
+    expect(downloadAndInstall).not.toHaveBeenCalled();
+    // …just a pinned toast with an Update button.
+    expect(toasts().some((t) => t?.includes("0.3.0 is available"))).toBe(true);
+    const action = document.querySelector<HTMLButtonElement>(".toast-action");
+    expect(action?.textContent).toBe("Update");
+
+    // Clicking it starts the download; a failure is reported even though the
+    // original check was silent — the user explicitly chose this download.
+    downloadAndInstall.mockRejectedValueOnce(new Error("disk full"));
+    action!.click();
+    await vi.waitFor(() =>
+      expect(toasts().some((t) => t?.includes("disk full"))).toBe(true),
+    );
+    expect(relaunch).not.toHaveBeenCalled();
   });
 
   it("ignores a second check while one is in flight", async () => {

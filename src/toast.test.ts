@@ -95,13 +95,14 @@ describe("toast", () => {
     expect(document.querySelectorAll(".toast")).toHaveLength(1);
   });
 
-  it("can change kind, so work that fails turns into an error", () => {
+  it("dismissing twice removes the toast exactly once", () => {
+    vi.useFakeTimers();
     const h = toast("Working", { duration: 0 });
-    expect(document.querySelector(".toast")!.className).toContain("info");
-    h.setKind("error");
-    const cls = document.querySelector(".toast")!.className;
-    expect(cls).toContain("error");
-    expect(cls).not.toContain("info");
+    h.dismiss();
+    h.dismiss(); // an action click and the duration timer can both land here
+    vi.advanceTimersByTime(400);
+    expect(document.querySelectorAll(".toast")).toHaveLength(0);
+    vi.useRealTimers();
   });
 });
 

@@ -2,11 +2,12 @@ import "./styles.css";
 import {
   createBackend,
   isTauri,
+  LIST_CAP,
   type GitStatus,
   type SearchHit,
   type SearchOptions,
 } from "./backend";
-import { FileTree, fileIcon, GIT_LABEL } from "./tree";
+import { FileTree, fileIcon, showContextMenu, GIT_LABEL } from "./tree";
 import { TAB_DND } from "./dnd";
 import { diffStat as diffStat_, parseDiff } from "./diff";
 import {
@@ -143,17 +144,28 @@ async function init() {
     return content.trim().length > 0;
   };
 
-  // Enable Save / Save As only when a markdown document (draft or file) is active.
+  // Keep the state-gated native menu items truthful: doc-scoped items need an
+  // active markdown document, tab-scoped need any tab, folder-scoped need an
+  // open workspace.
   const updateMenuState = () => {
     const t = activeTab();
-    const on = !!t && t.kind === "md";
-    void backend.setMenuState(on, on);
+    void backend.setMenuState(!!t && t.kind === "md", !!t, !!rootPath);
   };
 
   // -------------------------------------------------------------- status bar
 
   const nf = new Intl.NumberFormat();
+  // Coalesce to one repaint per frame — this fires on every keystroke.
+  let statusQueued = false;
   const updateStatus = () => {
+    if (statusQueued) return;
+    statusQueued = true;
+    requestAnimationFrame(() => {
+      statusQueued = false;
+      renderStatus();
+    });
+  };
+  const renderStatus = () => {
     const t = activeTab();
     if (!t) {
       statusPath.textContent = "";
@@ -223,6 +235,9 @@ async function init() {
         (git ? ` git git-${git}` : "");
       el.setAttribute("role", "tab");
       el.setAttribute("aria-selected", String(tab.path === activePath));
+      // Roving tabindex: the active tab joins the tab order; arrows move
+      // focus within the strip (wired once on tabsEl below).
+      el.tabIndex = tab.path === activePath ? 0 : -1;
       el.dataset.path = tab.path;
       el.draggable = true;
       el.title = tab.draft
@@ -296,54 +311,78 @@ async function init() {
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   };
 
+  // One context-menu implementation for the whole app: the shared one knows
+  // about Escape, blur dismissal, clamping and menu roles.
   const tabMenu = (x: number, y: number, tab: Tab) => {
-    document.querySelectorAll(".context-menu").forEach((m) => m.remove());
-    const menu = document.createElement("div");
-    menu.className = "context-menu";
-    const add = (label: string, run: () => void, disabled = false) => {
-      const b = document.createElement("button");
-      b.className = "context-menu-item";
-      b.textContent = label;
-      b.disabled = disabled;
-      b.addEventListener("click", () => {
-        menu.remove();
-        run();
-      });
-      menu.appendChild(b);
-    };
-    add("Close", () => void closeTab(tab.path));
-    add(
-      "Close Others",
-      () => void closeMany(tabs.filter((t) => t.path !== tab.path).map((t) => t.path)),
-      tabs.length < 2,
-    );
-    add("Close All", () => void closeMany(tabs.map((t) => t.path)));
-    if (!tab.draft) {
-      const sep = document.createElement("div");
-      sep.className = "context-menu-sep";
-      menu.appendChild(sep);
-      add("Reveal in Finder", () => {
-        void backend.revealPath(tab.path).catch((e) => toastError("Couldn’t reveal", e));
-      });
-      add("Copy Path", () => {
-        void navigator.clipboard
-          .writeText(tab.path)
-          .then(() => toast("Path copied"))
-          .catch(() => toast("Couldn’t copy path", { kind: "error" }));
-      });
-    }
-    document.body.appendChild(menu);
-    const r = menu.getBoundingClientRect();
-    menu.style.left = `${Math.min(x, window.innerWidth - r.width - 8)}px`;
-    menu.style.top = `${Math.min(y, window.innerHeight - r.height - 8)}px`;
-    const close = (e: Event) => {
-      if (!menu.contains(e.target as Node)) {
-        menu.remove();
-        window.removeEventListener("mousedown", close, true);
-      }
-    };
-    setTimeout(() => window.addEventListener("mousedown", close, true), 0);
+    showContextMenu(x, y, [
+      { label: "Close", action: () => void closeTab(tab.path) },
+      {
+        label: "Close Others",
+        disabled: tabs.length < 2,
+        action: () =>
+          void closeMany(tabs.filter((t) => t.path !== tab.path).map((t) => t.path)),
+      },
+      { label: "Close All", action: () => void closeMany(tabs.map((t) => t.path)) },
+      ...(tab.draft
+        ? []
+        : ([
+            "-",
+            {
+              label: "Reveal in Finder",
+              action: () =>
+                void backend
+                  .revealPath(tab.path)
+                  .catch((e) => toastError("Couldn’t reveal", e)),
+            },
+            {
+              label: "Copy Path",
+              action: () =>
+                void navigator.clipboard
+                  .writeText(tab.path)
+                  .then(() => toast("Path copied"))
+                  .catch(() => toast("Couldn’t copy path", { kind: "error" })),
+            },
+          ] as const)),
+    ]);
   };
+
+  // Keyboard access for the tab strip: Left/Right/Home/End move focus,
+  // Enter/Space activate, ⌫ closes. Without this the tablist announced tabs
+  // that nothing could reach.
+  tabsEl.addEventListener("keydown", (e) => {
+    const els = [...tabsEl.querySelectorAll<HTMLElement>(".tab")];
+    const i = els.indexOf(document.activeElement as HTMLElement);
+    if (i < 0) return;
+    const focus = (j: number) => els[Math.max(0, Math.min(j, els.length - 1))]?.focus();
+    switch (e.key) {
+      case "ArrowRight":
+        e.preventDefault();
+        focus(i + 1);
+        break;
+      case "ArrowLeft":
+        e.preventDefault();
+        focus(i - 1);
+        break;
+      case "Home":
+        e.preventDefault();
+        focus(0);
+        break;
+      case "End":
+        e.preventDefault();
+        focus(els.length - 1);
+        break;
+      case "Enter":
+      case " ":
+        e.preventDefault();
+        void activate(els[i].dataset.path!);
+        break;
+      case "Backspace":
+      case "Delete":
+        e.preventDefault();
+        void closeTab(els[i].dataset.path!);
+        break;
+    }
+  });
 
   const showSurface = (which: "welcome" | "editor" | "image") => {
     const isEditor = which === "editor";
@@ -885,6 +924,28 @@ async function init() {
     if (picked) await setRoot(picked);
   };
 
+  /** The workspace itself vanished — deleted, unmounted or renamed away. */
+  const onRootGone = async () => {
+    const name = rootPath ? baseOf(rootPath) : "The folder";
+    // The files are gone with it: nothing to flush, nothing worth keeping —
+    // except an unsaved draft, which lives only in memory.
+    if (!editor.isDraft) editor.detach();
+    tabs = tabs.filter((t) => t.draft);
+    rootPath = null;
+    tree.setGit(null);
+    treeEl.classList.add("hidden");
+    sidebarEmpty.classList.remove("hidden");
+    if (tabs.length) await activate(DRAFT);
+    else goWelcome();
+    renderTabs();
+    updateMenuState();
+    saveSession();
+    toast(`“${name}” is gone — it was moved, renamed or deleted.`, {
+      kind: "error",
+      duration: 8000,
+    });
+  };
+
   /** Open a recents entry — which may have been moved or deleted since. */
   const openRecent = async (path: string) => {
     try {
@@ -1010,11 +1071,16 @@ async function init() {
     document.documentElement.style.setProperty("--doc-scale", String(docScale));
   };
   /** delta: +1 in, -1 out, 0 reset. */
+  let zoomToast: ReturnType<typeof toast> | null = null;
   const zoom = (delta: number) => {
     docScale = delta === 0 ? 1 : clampScale(docScale + delta * 0.1);
     applyScale();
     saveSession();
-    toast(`Text size ${Math.round(docScale * 100)}%`, { duration: 1200 });
+    // Replace the previous zoom toast — holding ⌘= must not stack a column.
+    zoomToast?.dismiss();
+    zoomToast = toast(`Text size ${Math.round(docScale * 100)}%`, {
+      duration: 1200,
+    });
   };
   applyScale();
 
@@ -1033,6 +1099,7 @@ async function init() {
     const t = activeTab();
     return !!t && t.kind === "md";
   };
+  const isRich = () => isMd() && editor.mode === "rich" && !editor.isSplit;
 
   // ------------------------------------------------------------- searching
   const searchPanel = $("search-panel");
@@ -1081,7 +1148,10 @@ async function init() {
     treeEl.classList.add("hidden");
     sidebarEmpty.classList.add("hidden");
     searchPanel.classList.remove("hidden");
-    document.body.classList.remove("sidebar-hidden");
+    if (document.body.classList.contains("sidebar-hidden")) {
+      document.body.classList.remove("sidebar-hidden");
+      saveSession(); // the un-hide must survive a restart like any toggle
+    }
     const sel = selectionText();
     if (sel && sel.length < 100) searchInput.value = sel;
     searchInput.focus();
@@ -1238,6 +1308,12 @@ async function init() {
     { title: "Find…", hint: "⌘F", run: () => openFind(false), when: isMd },
     { title: "Find & Replace…", hint: "⌘⌥F", run: () => openFind(true), when: isMd },
     {
+      title: "Go to Heading…",
+      hint: "⌘⇧O",
+      run: () => void palette.show("#"),
+      when: isMd,
+    },
+    {
       title: "Toggle Markdown Source",
       hint: "⌘⇧M",
       run: () => editor.toggleMode(),
@@ -1251,16 +1327,18 @@ async function init() {
     { title: "Zoom In", hint: "⌘=", run: () => zoom(1) },
     { title: "Zoom Out", hint: "⌘-", run: () => zoom(-1) },
     { title: "Actual Size", hint: "⌘0", run: () => zoom(0) },
-    { title: "Bold", hint: "⌘B", run: () => editor.toggleBold(), when: isMd },
-    { title: "Italic", hint: "⌘I", run: () => editor.toggleItalic(), when: isMd },
-    { title: "Inline Code", hint: "⌘E", run: () => editor.toggleInlineCode(), when: isMd },
-    { title: "Link", run: () => editor.toggleLink(), when: isMd },
-    { title: "Quote", run: () => editor.toggleQuote(), when: isMd },
-    { title: "Bullet List", run: () => editor.toggleBulletList(), when: isMd },
-    { title: "Numbered List", run: () => editor.toggleOrderedList(), when: isMd },
-    { title: "Heading 1", run: () => editor.setHeading(1), when: isMd },
-    { title: "Heading 2", run: () => editor.setHeading(2), when: isMd },
-    { title: "Heading 3", run: () => editor.setHeading(3), when: isMd },
+    // Formatting commands only work in the rich editor — offering them in
+    // source or split view would be a silent no-op, so they hide instead.
+    { title: "Bold", hint: "⌘B", run: () => editor.toggleBold(), when: isRich },
+    { title: "Italic", hint: "⌘I", run: () => editor.toggleItalic(), when: isRich },
+    { title: "Inline Code", hint: "⌘E", run: () => editor.toggleInlineCode(), when: isRich },
+    { title: "Link", run: () => editor.toggleLink(), when: isRich },
+    { title: "Quote", run: () => editor.toggleQuote(), when: isRich },
+    { title: "Bullet List", run: () => editor.toggleBulletList(), when: isRich },
+    { title: "Numbered List", run: () => editor.toggleOrderedList(), when: isRich },
+    { title: "Heading 1", run: () => editor.setHeading(1), when: isRich },
+    { title: "Heading 2", run: () => editor.setHeading(2), when: isRich },
+    { title: "Heading 3", run: () => editor.setHeading(3), when: isRich },
   ];
 
   const palette = new CommandPalette({
@@ -1452,7 +1530,16 @@ async function init() {
 
   // A drop the editor doesn't claim must never navigate the window away.
   window.addEventListener("dragover", (e) => e.preventDefault());
-  window.addEventListener("drop", (e) => e.preventDefault());
+  window.addEventListener("drop", (e) => {
+    e.preventDefault();
+    // The editor's capture handler claims image drops (it stores the bytes
+    // beside the note). Anything else dropped from Finder can't be opened in
+    // place — a WKWebView drop carries file contents, not locations — so
+    // answer the gesture instead of silently ignoring it.
+    if (e.dataTransfer?.files.length) {
+      toast("To edit a file here, open its folder (⌘O).", { kind: "error" });
+    }
+  });
 
   window.addEventListener("keydown", (e) => {
     // Escape closes the find bar, then the diff panel.
@@ -1504,6 +1591,9 @@ async function init() {
         break;
       case "search-files":
         openSearch();
+        break;
+      case "goto-heading":
+        if (isMd()) void palette.show("#");
         break;
       case "close-tab":
         if (activePath) void closeTab(activePath);
@@ -1606,6 +1696,7 @@ async function init() {
       "menu-toggle-source": () => {
         if (isMd()) editor.toggleMode();
       },
+      "menu-goto-heading": () => isMd() && void palette.show("#"),
       "menu-toggle-split": () => toggleSplit(),
       "menu-toggle-sidebar": () => toggleSidebar(),
       "menu-toggle-theme": () => toggleTheme(),
@@ -1615,6 +1706,8 @@ async function init() {
     for (const [event, run] of Object.entries(menu)) void listen(event, run);
     void listen<number>("menu-zoom", (e) => zoom(e.payload));
     void listen<string>("menu-open-recent", (e) => void openRecent(e.payload));
+
+    void listen("root-gone", () => void onRootGone());
 
     // The workspace changed underneath us (another app, a sync client, git…).
     void listen<{ dirs: string[]; paths: string[]; bulk: boolean; git: boolean }>(
@@ -1646,14 +1739,10 @@ async function init() {
     );
   }
 
-  // No folder yet: show empty-state sidebar.
-  sidebarEmpty.classList.remove("hidden");
   updateMenuState();
 
   // ------------------------------------------------------- restore session
-  const lastRoot = isTauri
-    ? (saved.root ?? localStorage.getItem("mad:last-folder"))
-    : "/demo";
+  const lastRoot = isTauri ? saved.root : "/demo";
   if (lastRoot) {
     try {
       await backend.listDir(lastRoot); // still accessible?
@@ -1662,6 +1751,9 @@ async function init() {
       rootPath = null;
     }
   }
+  // Empty-state sidebar only once we know no folder is coming back —
+  // unconditional, it flashed "No folder open" on every launch.
+  if (!rootPath) sidebarEmpty.classList.remove("hidden");
 
   const root = rootPath;
   if (root) {
@@ -1670,7 +1762,11 @@ async function init() {
       // Drop tabs whose file has since disappeared (one cheap index read).
       let known: Set<string>;
       try {
-        known = new Set((await backend.listAll(root)).map((f) => f.path));
+        const all = await backend.listAll(root);
+        known = new Set(all.map((f) => f.path));
+        // A maxed-out index is truncated, not exhaustive — never drop a
+        // remembered tab on its say-so.
+        if (all.length >= LIST_CAP) for (const p of wanted) known.add(p);
       } catch {
         known = new Set(wanted);
       }
