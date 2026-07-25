@@ -166,6 +166,10 @@ export class MarkdownEditor {
   private lastSaved = "";
   /** On-disk stamp we've already warned about (see doCheckExternal). */
   private warnedStamp: string | null = null;
+  /** Markdown as of the last markdownUpdated — a cheap read for the status
+      bar, which otherwise re-serializes the whole document per keystroke.
+      Never used for saving: a save always serializes fresh. */
+  private statsCache: string | null = null;
   /** On-disk change stamp for currentPath, used to detect external edits. */
   private stamp = "";
   private dirty = false;
@@ -419,6 +423,7 @@ export class MarkdownEditor {
 
   /** Push `markdown` into whichever surfaces are live. */
   private applyContent(markdown: string) {
+    this.statsCache = null; // next getStats serializes once, then re-caches
     if (this._mode === "rich" || this.split) {
       this.crepe?.editor.action(replaceAll(markdown, true));
     }
@@ -445,7 +450,10 @@ export class MarkdownEditor {
 
   /** Word / character / line counts for the status bar. */
   getStats(): DocStats {
-    const text = this.content();
+    const text =
+      this._mode === "source"
+        ? this.sourceEl.value
+        : (this.statsCache ?? this.content());
     const words = countWords(text);
     const lines = text ? text.split("\n").length : 0;
     let cursor: DocStats["cursor"] = null;
@@ -685,6 +693,7 @@ export class MarkdownEditor {
     this.currentPath = path;
     this.stamp = stamp;
     this.warnedStamp = null;
+    this.statsCache = null;
     if (!this.crepe) {
       await this.mount(this._mode === "rich" || this.split ? markdown : "");
     } else if (this._mode === "rich" || this.split) {
@@ -708,6 +717,7 @@ export class MarkdownEditor {
     if (this.currentPath && this.dirty) return false;
     this.currentPath = null;
     this.stamp = "";
+    this.statsCache = null;
     if (!this.crepe) {
       await this.mount(this._mode === "rich" || this.split ? content : "");
     } else if (this._mode === "rich" || this.split) {
@@ -950,6 +960,7 @@ export class MarkdownEditor {
     crepe.on((api) => {
       api.markdownUpdated((_ctx, markdown, prevMarkdown) => {
         if (this._mode !== "rich") return;
+        this.statsCache = markdown;
         // Compare the same normalized form we save, or merely *opening* a file
         // would look like an edit.
         if (markdown === prevMarkdown || normalizeTrailer(markdown) === this.lastSaved)

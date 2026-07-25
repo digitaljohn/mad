@@ -9,8 +9,6 @@ export interface ToastHandle {
   dismiss(): void;
   /** Replace the message without the toast flickering out and back. */
   setText(text: string): void;
-  /** Swap the kind, e.g. from info to error when the work fails. */
-  setKind(kind: ToastKind): void;
 }
 
 interface ToastOptions {
@@ -48,11 +46,13 @@ export function toast(message: string, opts: ToastOptions = {}): ToastHandle {
   el.appendChild(text);
 
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let leaving = false;
   const dismiss = () => {
+    if (leaving) return; // reachable from the timer AND an action click
+    leaving = true;
     clearTimeout(timer);
     el.classList.add("leaving");
-    // Remove after the transition; guard against double-removal.
-    setTimeout(() => el.remove(), 180);
+    setTimeout(() => el.remove(), 180); // after the exit transition
   };
 
   if (action) {
@@ -81,10 +81,6 @@ export function toast(message: string, opts: ToastOptions = {}): ToastHandle {
     dismiss,
     setText: (next: string) => {
       text.textContent = next;
-    },
-    setKind: (next: ToastKind) => {
-      el.classList.remove("info", "error", "success");
-      el.classList.add(next);
     },
   };
 }

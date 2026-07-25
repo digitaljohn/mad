@@ -256,6 +256,28 @@ describe("git decorations", () => {
     expect(row("/w/pic.png").className).not.toContain("git");
   });
 
+  it("keeps decorations across a full re-render, not just the patch path", async () => {
+    // setGit patches badges in place; a later re-render (a refresh, a
+    // selection change) rebuilds rows from scratch and must reproduce the
+    // same marks — files and folder dots alike.
+    await tree.reveal("/w/journal/deep/note.md");
+    tree.setGit(info([{ path: "/w/journal/deep/note.md", status: "modified" }]));
+    tree.select("/w/README.md"); // forces a rebuild
+    const dir = row("/w/journal").querySelector(".git-badge")!;
+    expect(dir.textContent).toBe("");
+    expect(dir.getAttribute("title")).toContain("modified");
+    expect(
+      row("/w/journal/deep/note.md").querySelector(".git-badge")!.textContent,
+    ).toBe("M");
+  });
+
+  it("survives a git update while a row is being renamed", () => {
+    tree.startRename("/w/README.md");
+    // The rename row has no badge slot — patching must skip it, not corrupt it.
+    tree.setGit(info([{ path: "/w/README.md", status: "modified" }]));
+    expect(container.querySelector(".rename-input")).toBeTruthy();
+  });
+
   it("clears every mark when the folder stops being a repository", () => {
     tree.setGit(info([{ path: "/w/README.md", status: "modified" }]));
     tree.setGit(null);

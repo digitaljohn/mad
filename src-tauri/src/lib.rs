@@ -31,13 +31,64 @@ struct FileData {
 /// so the native File ▸ Open Recent submenu survives restarts.
 struct Recents(Mutex<Vec<String>>);
 
-/// Handles to the context-sensitive Save / Save As menu items so the frontend
-/// can enable/disable them as the active document changes. `enabled` remembers
-/// the desired state across menu rebuilds (e.g. when Open Recent changes).
+/// Which app state a gated menu item needs before it is enabled. An item
+/// that is live with nothing to act on is a silent no-op — worse than grey.
+#[derive(Clone, Copy)]
+enum Gate {
+    /// An active markdown document (file or draft).
+    Doc,
+    /// Any open tab.
+    Tab,
+    /// An open workspace folder.
+    Folder,
+}
+
+fn gate_on(gate: Gate, doc: bool, tab: bool, folder: bool) -> bool {
+    match gate {
+        Gate::Doc => doc,
+        Gate::Tab => tab,
+        Gate::Folder => folder,
+    }
+}
+
+/// Handles to the state-gated menu items so the frontend can enable/disable
+/// them as the app state changes. `enabled` remembers the latest state across
+/// menu rebuilds (e.g. when Open Recent changes).
 struct MenuState {
-    save: Mutex<Option<MenuItem<Wry>>>,
-    save_as: Mutex<Option<MenuItem<Wry>>>,
-    enabled: Mutex<(bool, bool)>,
+    gated: Mutex<Vec<(MenuItem<Wry>, Gate)>>,
+    enabled: Mutex<(bool, bool, bool)>,
+}
+
+/// Label each recent by folder name, disambiguating duplicates with their
+/// parent directory — two workspaces named "docs" must not render as two
+/// identical rows.
+fn recent_labels(paths: &[String]) -> Vec<String> {
+    let base = |p: &str| {
+        p.rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(p)
+            .to_string()
+    };
+    let mut counts = std::collections::HashMap::new();
+    for p in paths {
+        *counts.entry(base(p)).or_insert(0u32) += 1;
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let b = base(p);
+            if counts[&b] > 1 {
+                if let Some(parent) = Path::new(p)
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                {
+                    return format!("{b} — {parent}");
+                }
+            }
+            b
+        })
+        .collect()
 }
 
 /// Live filesystem watcher for the open workspace. Dropping it stops watching
@@ -234,7 +285,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let (save_on, save_as_on) = *app
+    let (doc, tab, folder) = *app
         .state::<MenuState>()
         .enabled
         .lock()
@@ -247,6 +298,20 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         }
         b.build(app)
     };
+    // A gated item is built in the right state and remembered, so
+    // set_menu_state can flip it live as the app state changes.
+    let mut gated: Vec<(MenuItem<Wry>, Gate)> = Vec::new();
+    let mut gitem =
+        |id: &str, label: &str, accel: Option<&str>, gate: Gate| -> tauri::Result<MenuItem<Wry>> {
+            let mut b =
+                MenuItemBuilder::with_id(id, label).enabled(gate_on(gate, doc, tab, folder));
+            if let Some(a) = accel {
+                b = b.accelerator(a);
+            }
+            let it = b.build(app)?;
+            gated.push((it.clone(), gate));
+            Ok(it)
+        };
 
     // The About panel shows a generic document icon unless it is handed one
     // explicitly — reuse the window icon, which Tauri already embedded from the
@@ -282,19 +347,18 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .quit()
         .build()?;
 
-    let save = MenuItemBuilder::with_id("save", "Save")
-        .accelerator("CmdOrCtrl+S")
-        .enabled(save_on)
-        .build(app)?;
-    let save_as = MenuItemBuilder::with_id("save_as", "Save As…")
-        .accelerator("CmdOrCtrl+Shift+S")
-        .enabled(save_as_on)
-        .build(app)?;
+    let save = gitem("save", "Save", Some("CmdOrCtrl+S"), Gate::Doc)?;
+    let save_as = gitem("save_as", "Save As…", Some("CmdOrCtrl+Shift+S"), Gate::Doc)?;
     let new_file = item("new_file", "New File", Some("CmdOrCtrl+N"))?;
-    let new_folder = item("new_folder", "New Folder", Some("CmdOrCtrl+Shift+N"))?;
+    let new_folder = gitem(
+        "new_folder",
+        "New Folder",
+        Some("CmdOrCtrl+Shift+N"),
+        Gate::Folder,
+    )?;
     let open_folder = item("open_folder", "Open Folder…", Some("CmdOrCtrl+O"))?;
-    let close_tab = item("close_tab", "Close Tab", Some("CmdOrCtrl+W"))?;
-    let export_html = item("export_html", "Export as HTML…", None)?;
+    let close_tab = gitem("close_tab", "Close Tab", Some("CmdOrCtrl+W"), Gate::Tab)?;
+    let export_html = gitem("export_html", "Export as HTML…", None, Gate::Doc)?;
 
     let mut recent = SubmenuBuilder::new(app, "Open Recent");
     if recents.is_empty() {
@@ -304,11 +368,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
                 .build(app)?,
         );
     } else {
-        for path in &recents {
-            let label = path
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .unwrap_or(path.as_str());
+        for (path, label) in recents.iter().zip(recent_labels(&recents)) {
             recent = recent
                 .item(&MenuItemBuilder::with_id(format!("recent::{path}"), label).build(app)?);
         }
@@ -341,16 +401,18 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .paste()
         .select_all()
         .separator()
-        .item(&item("find", "Find…", Some("CmdOrCtrl+F"))?)
-        .item(&item(
+        .item(&gitem("find", "Find…", Some("CmdOrCtrl+F"), Gate::Doc)?)
+        .item(&gitem(
             "find_replace",
             "Find & Replace…",
             Some("CmdOrCtrl+Alt+F"),
+            Gate::Doc,
         )?)
-        .item(&item(
+        .item(&gitem(
             "search_files",
             "Find in Files…",
             Some("CmdOrCtrl+Shift+F"),
+            Gate::Folder,
         )?)
         .separator()
         .item(&item(
@@ -361,22 +423,36 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .build()?;
 
     let view_menu = SubmenuBuilder::new(app, "View")
-        .item(&item("quick_open", "Quick Open…", Some("CmdOrCtrl+P"))?)
+        .item(&gitem(
+            "quick_open",
+            "Quick Open…",
+            Some("CmdOrCtrl+P"),
+            Gate::Folder,
+        )?)
         .item(&item(
             "command_palette",
             "Command Palette…",
             Some("CmdOrCtrl+Shift+P"),
         )?)
         .separator()
-        .item(&item(
+        .item(&gitem(
+            "goto_heading",
+            "Go to Heading…",
+            Some("CmdOrCtrl+Shift+O"),
+            Gate::Doc,
+        )?)
+        .separator()
+        .item(&gitem(
             "toggle_source",
             "Toggle Markdown Source",
             Some("CmdOrCtrl+Shift+M"),
+            Gate::Doc,
         )?)
-        .item(&item(
+        .item(&gitem(
             "toggle_split",
             "Toggle Split Preview",
             Some("CmdOrCtrl+Shift+V"),
+            Gate::Doc,
         )?)
         .item(&item(
             "toggle_sidebar",
@@ -384,10 +460,11 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
             Some("CmdOrCtrl+\\"),
         )?)
         .separator()
-        .item(&item(
+        .item(&gitem(
             "show_changes",
             "Show Changes",
             Some("CmdOrCtrl+Shift+D"),
+            Gate::Doc,
         )?)
         .separator()
         .item(&item("toggle_theme", "Toggle Light / Dark", None)?)
@@ -402,6 +479,20 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .maximize()
         .separator()
         .fullscreen()
+        .separator()
+        // ⌘W belongs to Close Tab, so the window needs its own shortcut —
+        // without this there is no keyboard way to close the window at all.
+        .item(&item(
+            "close_window",
+            "Close Window",
+            Some("CmdOrCtrl+Shift+W"),
+        )?)
+        .build()?;
+
+    // A "Help" submenu also gets macOS's built-in menu search field for free.
+    let help_menu = SubmenuBuilder::new(app, "Help")
+        .item(&item("help_github", "mad on GitHub", None)?)
+        .item(&item("help_issue", "Report an Issue…", None)?)
         .build()?;
 
     let menu = MenuBuilder::new(app)
@@ -410,49 +501,55 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .item(&edit_menu)
         .item(&view_menu)
         .item(&window_menu)
+        .item(&help_menu)
         .build()?;
 
     app.set_menu(menu)?;
 
     // Remember the new item handles so set_menu_state can toggle them live.
     let ms = app.state::<MenuState>();
-    *ms.save.lock().unwrap_or_else(|e| e.into_inner()) = Some(save);
-    *ms.save_as.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_as);
+    *ms.gated.lock().unwrap_or_else(|e| e.into_inner()) = gated;
     Ok(())
 }
 
-/// Enable/disable the Save and Save As menu items for the active document.
+/// Enable/disable the state-gated menu items: `doc` = an active markdown
+/// document, `tab` = any open tab, `folder` = an open workspace. Async so the
+/// call never runs on the UI thread; the menu mutation itself hops back to
+/// the main thread, where macOS requires it.
 #[tauri::command]
-fn set_menu_state(app: tauri::AppHandle, can_save: bool, can_save_as: bool) {
-    let ms = app.state::<MenuState>();
-    *ms.enabled.lock().unwrap_or_else(|e| e.into_inner()) = (can_save, can_save_as);
-    let save = ms.save.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let save_as = ms.save_as.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some(it) = save {
-        let _ = it.set_enabled(can_save);
+async fn set_menu_state(app: tauri::AppHandle, doc: bool, tab: bool, folder: bool) {
+    {
+        let ms = app.state::<MenuState>();
+        *ms.enabled.lock().unwrap_or_else(|e| e.into_inner()) = (doc, tab, folder);
     }
-    if let Some(it) = save_as {
-        let _ = it.set_enabled(can_save_as);
-    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let ms = handle.state::<MenuState>();
+        for (item, gate) in ms.gated.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let _ = item.set_enabled(gate_on(*gate, doc, tab, folder));
+        }
+    });
 }
 
 /// Record a folder as recently opened; persists and rebuilds the menu.
+/// Async: the config-dir write and PNG-decoding menu rebuild happen on every
+/// folder open, and neither belongs on the UI thread.
 #[tauri::command]
-fn push_recent(
-    app: tauri::AppHandle,
-    state: tauri::State<Recents>,
-    path: String,
-) -> Result<(), String> {
+async fn push_recent(app: tauri::AppHandle, path: String) -> Result<(), String> {
     // Only dialog-granted roots may enter the recents file — it seeds the
     // scope on next launch, so an unchecked entry would become a grant.
     scope().check_root(&path)?;
     let snapshot = {
+        let state = app.state::<Recents>();
         let mut recents = state.0.lock().unwrap_or_else(|e| e.into_inner());
         push_recent_list(&mut recents, path);
         recents.clone()
     };
     save_recents(&app, &snapshot);
-    let _ = rebuild_menu(&app);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = rebuild_menu(&handle); // menus are main-thread-only on macOS
+    });
     Ok(())
 }
 
@@ -877,20 +974,6 @@ async fn confirm_choice(
         .blocking_show()
 }
 
-/// Informational / error dialog with a single OK button.
-#[tauri::command]
-async fn message(app: tauri::AppHandle, title: String, message: String, error: bool) {
-    app.dialog()
-        .message(message)
-        .title(title)
-        .kind(if error {
-            MessageDialogKind::Error
-        } else {
-            MessageDialogKind::Info
-        })
-        .blocking_show();
-}
-
 /// Rename a file/folder in place. `to` is the full new path. Refuses to
 /// overwrite an existing entry.
 #[tauri::command]
@@ -1089,13 +1172,14 @@ fn walker(root: &str) -> ignore::WalkBuilder {
     b
 }
 
-/// Recursively list every markdown/image file under `root` (for Quick Open).
-#[tauri::command]
-async fn list_all(root: String) -> Result<Vec<FileHit>, String> {
-    scope().check_root(&root)?;
-    let root_p = Path::new(&root);
+/// Quick Open cap. Kept in step with `LIST_CAP` in src/backend.ts — the
+/// frontend treats a maxed-out index as non-authoritative.
+const MAX_LISTED: usize = 20_000;
+
+fn list_all_capped(root: &str, cap: usize) -> Vec<FileHit> {
+    let root_p = Path::new(root);
     let mut out = Vec::new();
-    for entry in walker(&root).build().flatten() {
+    for entry in walker(root).build().flatten() {
         let path = entry.path();
         if path.is_file() && shown_ext(path) {
             let rel = path
@@ -1107,10 +1191,22 @@ async fn list_all(root: String) -> Result<Vec<FileHit>, String> {
                 path: path.to_string_lossy().into_owned(),
                 rel,
             });
+            // A workspace pointed at a home directory must not ship a
+            // six-figure JSON payload into the webview.
+            if out.len() >= cap {
+                break;
+            }
         }
     }
     out.sort_by_key(|f| f.rel.to_lowercase());
-    Ok(out)
+    out
+}
+
+/// Recursively list every markdown/image file under `root` (for Quick Open).
+#[tauri::command]
+async fn list_all(root: String) -> Result<Vec<FileHit>, String> {
+    scope().check_root(&root)?;
+    Ok(list_all_capped(&root, MAX_LISTED))
 }
 
 #[derive(Serialize)]
@@ -1276,7 +1372,9 @@ fn is_git_signal(root: &Path, path: &Path) -> bool {
     }
     matches!(
         parts.next().as_deref(),
-        Some("HEAD" | "index" | "ORIG_HEAD" | "MERGE_HEAD" | "refs")
+        // packed-refs: `git gc`/`pack-refs` moves every ref there — without
+        // it, a post-gc commit would update no badge until the next focus.
+        Some("HEAD" | "index" | "ORIG_HEAD" | "MERGE_HEAD" | "refs" | "packed-refs")
     )
 }
 
@@ -1299,10 +1397,12 @@ fn classify_status(x: char, y: char) -> &'static str {
 ///
 /// Everything else is dropped. A folder dot that leads nowhere is worse than no
 /// dot, and in a repo full of source this also keeps the payload small. The
-/// extension test comes first so a monorepo's thousands of changed `.c` files
-/// cost no `stat` calls.
+/// extension test comes first, but a directory qualifies regardless of dots in
+/// its name — `vendor.v2` is a perfectly good submodule name, and skipping it
+/// meant its changed documents were never found. The `stat` this costs is per
+/// *kept-or-directory* candidate, once per debounced refresh.
 fn shows_in_tree(path: &Path) -> bool {
-    shown_ext(path) || (path.extension().is_none() && path.is_dir())
+    shown_ext(path) || path.is_dir()
 }
 
 /// Parse `git status --porcelain -z` output into absolute-path entries.
@@ -1375,7 +1475,12 @@ fn expand_submodules(entries: &mut Vec<GitEntry>, depth: u8) {
         .map(|e| e.path.clone())
         .collect();
     for dir in dirs {
-        let Some(raw) = git_output(&dir, &STATUS_ARGS) else {
+        // Same flags as the top-level status: without --ignore-submodules a
+        // nested submodule's untracked build output would re-report the very
+        // noise the top level deliberately suppresses.
+        let mut args = STATUS_ARGS.to_vec();
+        args.push("--ignore-submodules=untracked");
+        let Some(raw) = git_output(&dir, &args) else {
             continue;
         };
         // Inside the submodule, porcelain paths are relative to *its* root.
@@ -1414,22 +1519,78 @@ fn drop_marks_that_lead_nowhere(entries: &mut Vec<GitEntry>) {
 }
 
 fn git_output_lenient(dir: &str, args: &[&str]) -> Option<String> {
-    let out = git_command(dir, args).output().ok()?;
+    let out = git_run(dir, args)?;
     // Lossy: one non-UTF-8 byte anywhere must not blank the whole answer.
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Every git invocation goes through here so the env is consistent.
-fn git_command(dir: &str, args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new("git");
+/// Absolute path of a working git, probed once per launch. None ⇒ git
+/// features stay quietly off.
+///
+/// A Finder-launched app inherits a minimal PATH (`/usr/bin:/bin:…`):
+/// Homebrew's git is invisible there, and `/usr/bin/git` is Apple's Command
+/// Line Tools shim — invoking it *without* the tools installed pops the OS
+/// "install developer tools?" dialog, which this app would otherwise trigger
+/// on every save and window focus. So probe the common real locations first,
+/// and only trust the PATH shim when xcode-select says the tools exist.
+fn git_binary() -> Option<&'static str> {
+    static BIN: OnceLock<Option<String>> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let works = |bin: &str| {
+            std::process::Command::new(bin)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        for cand in ["/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+            if works(cand) {
+                return Some(cand.to_string());
+            }
+        }
+        let clt_installed = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(!cfg!(target_os = "macos")); // only macOS has the shim trap
+        if clt_installed && works("git") {
+            return Some("git".to_string());
+        }
+        None
+    })
+    .as_deref()
+}
+
+/// A status against a dead network mount must not pin a worker forever.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run git with a consistent env and a hard timeout. On timeout the helper
+/// thread (and its child) is abandoned — it dies with its blocked IO, which
+/// beats wedging the caller.
+fn git_run(dir: &str, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new(git_binary()?);
     cmd.current_dir(dir)
         .args(args)
         // Paths this app passes are literal file names, never patterns —
         // without this, discarding "[draft] plan.md" globs, matches nothing
         // in HEAD, and the file is trashed instead of restored.
         .env("GIT_LITERAL_PATHSPECS", "1")
+        // `git status` normally refreshes .git/index as a side effect; the
+        // watcher sees that write, refreshes status, which writes again —
+        // a subprocess every debounce interval, forever. Read-only status.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null());
-    cmd
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    rx.recv_timeout(GIT_TIMEOUT).ok()?.ok()
 }
 
 /// Unified diff for one file against the last commit, staged changes included.
@@ -1536,7 +1697,7 @@ async fn git_discard_kind(path: String) -> Result<String, String> {
 }
 
 fn git_output(dir: &str, args: &[&str]) -> Option<String> {
-    let out = git_command(dir, args).output().ok()?;
+    let out = git_run(dir, args)?;
     if !out.status.success() {
         return None;
     }
@@ -1598,11 +1759,24 @@ struct FsChange {
     git: bool,
 }
 
+/// Rebuild a watcher event path onto the root the user opened. notify
+/// canonicalizes its watch root and FSEvents reports canonical paths, so a
+/// workspace opened as `/tmp/notes` gets events for `/private/tmp/notes` —
+/// which match nothing the frontend holds unless mapped back.
+fn remap_event_path(canon_root: &Path, user_root: &Path, p: PathBuf) -> PathBuf {
+    match p.strip_prefix(canon_root) {
+        Ok(rel) => user_root.join(rel),
+        Err(_) => p,
+    }
+}
+
 /// Watch `path` recursively and emit debounced `fs-change` events so the tree
 /// and the open document stay in step with edits made outside the app.
+/// Async: swapping watchers joins an FSEvents run loop — not main-thread work.
 #[tauri::command]
-fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+async fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
     scope().check_root(&path)?;
+    let canon_root = fs::canonicalize(&path).map_err(friendly_io)?;
     let state = app.state::<FsWatcher>();
     // Drop the previous watcher first; that closes its channel and ends the
     // debounce thread below.
@@ -1626,6 +1800,9 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
             |set: &mut BTreeSet<PathBuf>, git: &mut bool, res: notify::Result<notify::Event>| {
                 let Ok(ev) = res else { return };
                 for p in ev.paths {
+                    // FSEvents speaks canonical paths; the app speaks the
+                    // user's. Translate before any filter or comparison.
+                    let p = remap_event_path(&canon_root, &root, p);
                     // Git's own bookkeeping is invisible in the tree but changes
                     // every file's status, so it's a refresh signal, not content.
                     if is_git_signal(&root, &p) {
@@ -1664,6 +1841,12 @@ fn watch_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break, // quiet
                     Err(_) => return,                                         // watcher dropped
                 }
+            }
+            // The workspace itself may be what changed: deleted or renamed
+            // away. Tell the frontend instead of going silently stale.
+            if !root.exists() {
+                let _ = handle.emit("root-gone", ());
+                return;
             }
             if paths.is_empty() && !git {
                 continue;
@@ -1742,27 +1925,45 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            let recents = load_recents(&handle);
-            // Recents seed the scope: every entry was dialog-granted when it
-            // was first opened, and push_recent refuses anything that wasn't.
-            for r in &recents {
-                scope().grant_root(r);
-            }
-            app.manage(Recents(Mutex::new(recents)));
+            app.manage(Recents(Mutex::new(Vec::new())));
             app.manage(MenuState {
-                save: Mutex::new(None),
-                save_as: Mutex::new(None),
-                enabled: Mutex::new((false, false)),
+                gated: Mutex::new(Vec::new()),
+                enabled: Mutex::new((false, false, false)),
             });
             app.manage(FsWatcher(Mutex::new(None)));
             app.manage(ExitFlow(Arc::new(ExitFlowState::default())));
             rebuild_menu(&handle)?;
+            // Reading the recents means stat'ing every entry, and a stale
+            // network mount can hang a stat for its full mount timeout — so
+            // none of it may run on the main thread before the window shows.
+            // For healthy disks this finishes long before the webview's first
+            // invoke; a hung mount degrades to a Welcome-screen launch.
+            let bg = app.handle().clone();
+            std::thread::spawn(move || {
+                let recents = load_recents(&bg);
+                // Recents seed the scope: every entry was dialog-granted when
+                // first opened, and push_recent refuses anything that wasn't.
+                for r in &recents {
+                    scope().grant_root(r);
+                }
+                let has_any = !recents.is_empty();
+                *bg.state::<Recents>()
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = recents;
+                if has_any {
+                    let main = bg.clone();
+                    let _ = bg.run_on_main_thread(move || {
+                        let _ = rebuild_menu(&main);
+                    });
+                }
+            });
             Ok(())
         })
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             // Menu items that are just a named signal to the frontend.
-            const FORWARD: [(&str, &str); 19] = [
+            const FORWARD: [(&str, &str); 20] = [
                 ("open_folder", "menu-open-folder"),
                 ("new_file", "menu-new-file"),
                 ("new_folder", "menu-new-folder"),
@@ -1776,6 +1977,7 @@ pub fn run() {
                 ("toggle_spellcheck", "menu-toggle-spellcheck"),
                 ("quick_open", "menu-quick-open"),
                 ("command_palette", "menu-command-palette"),
+                ("goto_heading", "menu-goto-heading"),
                 ("toggle_source", "menu-toggle-source"),
                 ("toggle_split", "menu-toggle-split"),
                 ("toggle_sidebar", "menu-toggle-sidebar"),
@@ -1804,6 +2006,26 @@ pub fn run() {
                     save_recents(app, &[]);
                     let _ = rebuild_menu(app);
                 }
+                "close_window" => {
+                    // Through close(), not destroy(): the frontend's
+                    // close-requested flush still runs.
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.close();
+                    }
+                }
+                "help_github" => {
+                    use tauri_plugin_opener::OpenerExt;
+                    let _ = app
+                        .opener()
+                        .open_url("https://github.com/digitaljohn/mad", None::<&str>);
+                }
+                "help_issue" => {
+                    use tauri_plugin_opener::OpenerExt;
+                    let _ = app.opener().open_url(
+                        "https://github.com/digitaljohn/mad/issues/new",
+                        None::<&str>,
+                    );
+                }
                 other => {
                     if let Some(path) = other.strip_prefix("recent::") {
                         let _ = app.emit("menu-open-recent", path.to_string());
@@ -1826,7 +2048,6 @@ pub fn run() {
             export_dialog,
             confirm,
             confirm_choice,
-            message,
             rename_path,
             move_into,
             create_folder,
@@ -2979,6 +3200,52 @@ mod tests {
         let err = run(read_file(t.s("link.md"))).unwrap_err();
         assert!(err.contains("outside the open workspace"), "{err}");
         let _ = fs::remove_dir_all(denied("target"));
+    }
+
+    // ------------------------------------------------------------- watcher
+
+    #[test]
+    fn watcher_events_are_remapped_into_the_users_path_space() {
+        // FSEvents reports /private/tmp/… for a workspace opened as /tmp/…;
+        // every downstream comparison uses the user's spelling.
+        let canon = Path::new("/private/tmp/notes");
+        let user = Path::new("/tmp/notes");
+        assert_eq!(
+            remap_event_path(canon, user, PathBuf::from("/private/tmp/notes/sub/a.md")),
+            PathBuf::from("/tmp/notes/sub/a.md")
+        );
+        // Paths outside the root pass through untouched.
+        assert_eq!(
+            remap_event_path(canon, user, PathBuf::from("/private/tmp/other/b.md")),
+            PathBuf::from("/private/tmp/other/b.md")
+        );
+    }
+
+    // ---------------------------------------------------------------- menu
+
+    #[test]
+    fn duplicate_recent_folder_names_get_their_parent_as_a_tiebreak() {
+        let paths = vec![
+            "/Users/x/work/docs".to_string(),
+            "/Users/x/personal/docs".to_string(),
+            "/Users/x/specs".to_string(),
+        ];
+        assert_eq!(
+            recent_labels(&paths),
+            vec!["docs — work", "docs — personal", "specs"]
+        );
+    }
+
+    #[test]
+    fn quick_open_stops_at_its_cap() {
+        let t = TempDir::new();
+        for i in 0..30 {
+            t.write(&format!("n{i:02}.md"), "x");
+        }
+        let all = list_all_capped(&t.0.to_string_lossy(), 10);
+        assert_eq!(all.len(), 10);
+        let uncapped = list_all_capped(&t.0.to_string_lossy(), 1000);
+        assert_eq!(uncapped.len(), 30);
     }
 
     // ----------------------------------------------------------- exit flow

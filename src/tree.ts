@@ -82,14 +82,17 @@ export interface TreeCallbacks {
   onExpandedChange?(expanded: string[]): void;
 }
 
-interface MenuItem {
+export interface MenuItem {
   label: string;
   danger?: boolean;
+  disabled?: boolean;
   action: () => void;
 }
 
-/** A minimal cursor-anchored context menu rendered into <body>. */
-function showContextMenu(x: number, y: number, items: (MenuItem | "-")[]) {
+/** A minimal cursor-anchored context menu rendered into <body>.
+    Exported so the tab strip shares one implementation (Escape, blur
+    dismissal and menu roles included) instead of growing a lesser clone. */
+export function showContextMenu(x: number, y: number, items: (MenuItem | "-")[]) {
   document.querySelectorAll(".context-menu").forEach((m) => m.remove());
   const menu = document.createElement("div");
   menu.className = "context-menu";
@@ -104,6 +107,7 @@ function showContextMenu(x: number, y: number, items: (MenuItem | "-")[]) {
     const el = document.createElement("button");
     el.className = "context-menu-item" + (it.danger ? " danger" : "");
     el.setAttribute("role", "menuitem");
+    el.disabled = it.disabled ?? false;
     el.textContent = it.label;
     el.addEventListener("click", () => {
       dismiss();
@@ -224,7 +228,37 @@ export class FileTree {
         dir = next;
       }
     }
-    this.render();
+    // Decorations never add or remove rows, so patch them in place: a full
+    // rebuild here (this fires on every save) would destroy an in-progress
+    // drag and yank the keyboard focus around.
+    this.patchGitBadges();
+  }
+
+  /** Re-apply git decorations to the already-rendered rows. */
+  private patchGitBadges() {
+    for (const r of this.rows) {
+      if (this.renamingPath === r.path) continue; // input row has no badge slot
+      const row = this.rowEl(r.path);
+      if (!row) continue;
+      const status = r.isDir
+        ? worse(this.gitDirs.get(r.path), this.git.get(r.path))
+        : this.git.get(r.path);
+      row.classList.remove(
+        "git",
+        ...(Object.keys(GIT_BADGE) as GitStatus[]).map((s) => `git-${s}`),
+      );
+      row.querySelector(".git-badge")?.remove();
+      if (status) {
+        row.classList.add("git", `git-${status}`);
+        const badge = document.createElement("span");
+        badge.className = "git-badge";
+        badge.textContent = r.isDir ? "" : GIT_BADGE[status];
+        badge.title = r.isDir
+          ? `Contains ${GIT_LABEL[status].toLowerCase()} files`
+          : GIT_LABEL[status];
+        row.appendChild(badge);
+      }
+    }
   }
 
   /** Re-read a directory (e.g. after creating a file) and re-render. */
@@ -303,12 +337,16 @@ export class FileTree {
 
   private render() {
     const hadFocus = this.container.contains(document.activeElement);
+    const scrollTop = this.container.scrollTop;
     this.container.innerHTML = "";
     this.rows = [];
     if (!this.root) return;
     const frag = document.createDocumentFragment();
     this.renderLevel(frag, this.root, 0);
     this.container.appendChild(frag);
+    // A rebuild momentarily collapses the content to zero height, which
+    // clamps the scroll — put it back where the user left it.
+    this.container.scrollTop = scrollTop;
     // Keep the roving tabindex pointing at something that still exists.
     if (!this.rows.some((r) => r.path === this.focusPath)) {
       this.focusPath = this.rows[0]?.path ?? null;
@@ -640,7 +678,10 @@ export class FileTree {
       },
       {
         label: "Copy Path",
-        action: () => void copyText(entry.path).then(() => toast("Path copied")),
+        action: () =>
+          void copyText(entry.path)
+            .then(() => toast("Path copied"))
+            .catch(() => toast("Couldn’t copy path", { kind: "error" })),
       },
       "-",
       {
@@ -666,7 +707,10 @@ export class FileTree {
       },
       {
         label: "Copy Path",
-        action: () => void copyText(root).then(() => toast("Path copied")),
+        action: () =>
+          void copyText(root)
+            .then(() => toast("Path copied"))
+            .catch(() => toast("Couldn’t copy path", { kind: "error" })),
       },
     ]);
   }

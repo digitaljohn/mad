@@ -319,11 +319,9 @@ describe("dialogs and shell in the mock", () => {
   });
 
   it("has no-op implementations for the native-only calls", async () => {
-    vi.spyOn(window, "alert").mockImplementation(() => {});
-    await expect(be.message("t", "m", true)).resolves.toBeUndefined();
     await expect(be.revealPath("/demo")).resolves.toBeUndefined();
     await expect(be.openPath("/demo")).resolves.toBeUndefined();
-    await expect(be.setMenuState(true, true)).resolves.toBeUndefined();
+    await expect(be.setMenuState(true, true, true)).resolves.toBeUndefined();
     await expect(be.watchFolder("/demo")).resolves.toBeUndefined();
   });
 

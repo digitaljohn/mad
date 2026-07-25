@@ -96,8 +96,6 @@ export interface Backend {
     ok: string,
     cancel: string,
   ): Promise<boolean>;
-  /** Single-button information / error dialog. */
-  message(title: string, message: string, error: boolean): Promise<void>;
   /** Rename in place (`to` is the full new path). Returns the new path. */
   renamePath(from: string, to: string): Promise<string>;
   /** Move `src` into `destDir`. Returns the new path. */
@@ -112,8 +110,9 @@ export interface Backend {
   revealPath(path: string): Promise<void>;
   /** Open the item in the OS default application. */
   openPath(path: string): Promise<void>;
-  /** Enable/disable the native Save / Save As menu items. */
-  setMenuState(canSave: boolean, canSaveAs: boolean): Promise<void>;
+  /** Enable/disable the state-gated native menu items: `doc` = an active
+      markdown document, `tab` = any open tab, `folder` = an open workspace. */
+  setMenuState(doc: boolean, tab: boolean, folder: boolean): Promise<void>;
   /** Every markdown/image file under `root` (for Quick Open). */
   listAll(root: string): Promise<FileHit[]>;
   /** Full-text search across markdown files under `root`. */
@@ -136,6 +135,10 @@ export interface Backend {
 }
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
+
+/** Quick Open result cap — kept in step with `MAX_LISTED` in lib.rs. An index
+    of exactly this size is truncated and must not be treated as exhaustive. */
+export const LIST_CAP = 20_000;
 
 const MIME: Record<string, string> = {
   png: "image/png",
@@ -176,8 +179,6 @@ async function tauriBackend(): Promise<Backend> {
     confirm: (title, message) => invoke<boolean>("confirm", { title, message }),
     confirmChoice: (title, message, ok, cancel) =>
       invoke<boolean>("confirm_choice", { title, message, ok, cancel }),
-    message: (title, message, error) =>
-      invoke<void>("message", { title, message, error }),
     renamePath: (from, to) => invoke<string>("rename_path", { from, to }),
     moveInto: (src, destDir) => invoke<string>("move_into", { src, destDir }),
     createFolder: (dir, name) => invoke<string>("create_folder", { dir, name }),
@@ -185,8 +186,8 @@ async function tauriBackend(): Promise<Backend> {
     trashPath: (path) => invoke<void>("trash_path", { path }),
     revealPath: (path) => invoke<void>("reveal_path", { path }),
     openPath: (path) => invoke<void>("open_path", { path }),
-    setMenuState: (canSave, canSaveAs) =>
-      invoke<void>("set_menu_state", { canSave, canSaveAs }),
+    setMenuState: (doc, tab, folder) =>
+      invoke<void>("set_menu_state", { doc, tab, folder }),
     listAll: (root) => invoke<FileHit[]>("list_all", { root }),
     searchFiles: (root, query, opts) =>
       invoke<SearchResult>("search_files", {
@@ -325,7 +326,6 @@ function mockBackend(): Backend {
     confirm: async (_title, message) => window.confirm(message),
     confirmChoice: async (_title, message, ok, cancel) =>
       window.confirm(`${message}\n\nOK = ${ok}, Cancel = ${cancel}`),
-    message: async (title, message) => void window.alert(`${title}\n\n${message}`),
     renamePath: async (from, to) => {
       if (files.has(to) || dirs.has(to)) throw new Error("already exists");
       relocate(from, to);
