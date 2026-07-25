@@ -6,8 +6,8 @@
 # SHA256SUMS.txt. See docs/RELEASING.md.
 
 cask "mad" do
-  version "0.1.0"
-  sha256 "REPLACE_WITH_THE_DMG_SHA256_FROM_SHA256SUMS_TXT"
+  version "0.1.1"
+  sha256 "ff85675df06c3588d3834761f2340d0fef2b5ababed076cf1c2cfddc49127fe8" # dmg, from SHA256SUMS.txt
 
   url "https://github.com/digitaljohn/mad/releases/download/v#{version}/mad_#{version}_universal.dmg",
       verified: "github.com/digitaljohn/mad/"
@@ -21,6 +21,10 @@ cask "mad" do
   end
 
   depends_on macos: ">= :big_sur"
+
+  # The app updates itself (Tauri updater). Without this, `brew outdated`
+  # reports a self-updated install as stale and `brew upgrade` stomps it.
+  auto_updates true
 
   app "mad.app"
 

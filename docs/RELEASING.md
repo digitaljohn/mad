@@ -3,7 +3,10 @@
 ## Cutting a release
 
 ```bash
-node scripts/set-version.mjs 0.2.0     # updates all three version files
+node scripts/set-version.mjs 0.2.0     # updates all four version files
+                                       # (package.json, Cargo.toml, Cargo.lock,
+                                       #  tauri.conf.json — the lock is the one
+                                       #  everyone forgets)
 git commit -am "Release 0.2.0"
 git tag v0.2.0
 git push && git push --tags
@@ -52,7 +55,8 @@ took effect rather than assuming.
 
 ## Homebrew
 
-For a technical audience this is the nicest install, and it costs nothing:
+For a technical audience this is the nicest install, and it costs nothing.
+Once the tap exists (it does not yet), it will be:
 
 ```bash
 brew install --cask digitaljohn/tap/mad

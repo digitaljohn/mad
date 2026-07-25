@@ -25,3 +25,10 @@ dist-ssr
 
 # Test coverage output
 coverage
+
+# Local release-build output and anything that must never be committed
+dist-release/
+*.dmg
+*.app.tar.gz
+.env
+.env.*

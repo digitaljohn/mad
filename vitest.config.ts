@@ -19,16 +19,18 @@ export default defineConfig({
         // otherwise would mean asserting nothing while reporting a bigger
         // number. See CONTRIBUTING.md.
         //
-        // main.ts is one long init() of DOM wiring and dynamic `@tauri-apps/*`
-        // imports; its logic has been extracted into paths/diff/session, which
-        // are covered directly.
+        // main.ts is init(): DOM wiring, event plumbing and dynamic
+        // `@tauri-apps/*` imports. Its decision logic is extracted into
+        // covered modules (paths, diff, session, keys, updater) as it grows
+        // testable seams — what remains here is untested orchestration, and
+        // this exclusion is the honest record of that.
         "src/main.ts",
         // editor.ts constructs a Milkdown Crepe instance. Crepe needs real
         // layout, ranges and contenteditable behaviour that jsdom does not
         // implement; its pure helpers live in paths.ts and are covered there.
         "src/editor.ts",
-        // Tauri IPC surface — invoke() only exists inside the app. The mock
-        // half of this file is covered via backend.test.ts.
+        // Tauri IPC surface — invoke() only exists inside the app. The
+        // browser mock lives in backend.mock.ts, which IS measured.
         "src/backend.ts",
       ],
       // The covered modules are fully exercised. Branches sit a hair under
