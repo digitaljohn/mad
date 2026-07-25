@@ -39,6 +39,12 @@ const answer = 42;
 console.log("hello from mad");
 \`\`\`
 
+## Links
+
+Links to other notes open right here — try [README](./README.md) or
+[an idea](journal/ideas.md). [The web](https://example.com) opens in your
+browser instead.
+
 > Quotes work too. Select text to see the formatting toolbar.
 
 - [x] folder browser

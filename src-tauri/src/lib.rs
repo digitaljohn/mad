@@ -658,6 +658,13 @@ fn focused_label(app: &tauri::AppHandle) -> Option<String> {
         .map(|(label, _)| label)
 }
 
+/// The label for the Nth extra window. Every one of these must be matched by
+/// a pattern in `capabilities/default.json`, or the window comes up with no
+/// permissions: undraggable, unclosable, and deaf to every menu command.
+fn window_label(n: u32) -> String {
+    format!("mad-{n}")
+}
+
 /// Open another window. Each one carries its own workspace, tabs and watcher —
 /// mad is a folder-at-a-time editor, and this is how you get two folders.
 #[tauri::command]
@@ -666,7 +673,7 @@ async fn new_window(app: tauri::AppHandle) -> Result<(), String> {
     // gets reused too, rather than accumulating an entry per window ever made.
     let taken: std::collections::HashSet<String> = app.webview_windows().into_keys().collect();
     let label = (2..100)
-        .map(|n| format!("mad-{n}"))
+        .map(window_label)
         .find(|l| !taken.contains(l))
         .ok_or("Too many windows are already open")?;
     tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::default())
@@ -3585,6 +3592,52 @@ mod tests {
         // would let a stale confirmed-set exit the app at the wrong moment.
         let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
         assert!(!everyone_confirmed(&confirmed, &[]));
+    }
+
+    #[test]
+    fn every_window_label_is_covered_by_the_capability() {
+        // A capability scoped to "main" alone shipped in 0.2.0: extra windows
+        // came up with no permissions, so they could not be dragged, could not
+        // be closed, and never received a single menu command. Nothing in the
+        // build catches that — the app compiles and launches perfectly.
+        #[derive(serde::Deserialize)]
+        struct Capability {
+            windows: Vec<String>,
+            permissions: Vec<String>,
+        }
+        let raw = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/default.json"),
+        )
+        .expect("capabilities/default.json is missing");
+        let cap: Capability = serde_json::from_str(&raw).expect("capability is not valid JSON");
+
+        // Only `*`-suffixed and exact patterns are used here; keep the matcher
+        // as dumb as the patterns so it can't disagree with Tauri by accident.
+        let covered = |label: &str| {
+            cap.windows.iter().any(|p| match p.strip_suffix('*') {
+                Some(prefix) => label.starts_with(prefix),
+                None => p == label,
+            })
+        };
+
+        assert!(covered("main"), "the first window must be covered");
+        for n in [2u32, 3, 9, 42, 99] {
+            let label = window_label(n);
+            assert!(covered(&label), "window label {label} has no capability");
+        }
+
+        // core:default grants only read-only window queries, so anything mad
+        // does *to* a window has to be named. These two are load-bearing:
+        // without them the window cannot be moved or closed.
+        for needed in [
+            "core:window:allow-start-dragging",
+            "core:window:allow-destroy",
+        ] {
+            assert!(
+                cap.permissions.iter().any(|p| p == needed),
+                "capability is missing {needed}"
+            );
+        }
     }
 
     #[test]

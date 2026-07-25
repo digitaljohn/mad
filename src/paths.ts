@@ -61,6 +61,54 @@ export function remapPath(path: string, from: string, to: string): string {
   return path;
 }
 
+/** What a link in a document points at. */
+export type LinkTarget =
+  | { kind: "external"; url: string }
+  /** A path on disk — another note, an image, or something for the OS. */
+  | { kind: "file"; path: string }
+  /** A heading in the document being read. */
+  | { kind: "anchor"; id: string }
+  | { kind: "ignore" };
+
+const URI_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
+
+/**
+ * Work out where a link goes, from the href *as written in the markdown*.
+ *
+ * It has to be the raw attribute: the DOM resolves `./spec.md` against the
+ * webview's own origin, so `anchor.href` reads back as `http://localhost/…`
+ * and a relative link to the note next door looks exactly like a link to the
+ * open internet. That mistake sent people to their browser instead of to
+ * their document.
+ */
+export function resolveLink(raw: string | null, docPath: string | null): LinkTarget {
+  const href = (raw ?? "").trim();
+  if (!href) return { kind: "ignore" };
+  if (href.startsWith("#")) {
+    return { kind: "anchor", id: decodeHref(href.slice(1)) };
+  }
+  // Any scheme at all — http, mailto, obsidian… — belongs to the OS.
+  if (URI_SCHEME.test(href)) return { kind: "external", url: href };
+
+  // A path can't carry a query or fragment; drop them before resolving.
+  const bare = decodeHref(href.split(/[?#]/)[0]);
+  if (!bare) return { kind: "ignore" };
+  if (bare.startsWith("/")) return { kind: "file", path: normalize(bare) };
+  // Relative links are relative to the document holding them, so an unsaved
+  // draft has nothing to resolve against.
+  if (!docPath) return { kind: "ignore" };
+  return { kind: "file", path: normalize(`${dirOf(docPath)}/${bare}`) };
+}
+
+/** Markdown writers escape spaces as %20; a malformed escape is literal. */
+function decodeHref(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
 /** Escape a string for literal use inside a RegExp. */
 export function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
