@@ -16,13 +16,6 @@ jobs:
   macos:
     name: macOS universal
     runs-on: macos-latest
-    # Job level, not step level: a step's own `env:` block is not in scope for
-    # that same step's `if:` condition, so a step gated on its own env never
-    # runs. Apple signing is opt-in via these secrets and has to be gated
-    # somewhere that works.
-    env:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -84,37 +77,46 @@ jobs:
           key: cargo-release-universal-${{ hashFiles('src-tauri/Cargo.lock') }}
           restore-keys: cargo-release-universal-
 
-      # Signing is optional. With no Apple credentials configured the build
-      # still produces a working .dmg — macOS just asks the user to allow it the
-      # first time. Add the secrets and this step starts signing with no other
-      # change; see docs/RELEASING.md.
-      - name: Import the signing certificate
-        if: ${{ env.APPLE_CERTIFICATE != '' }}
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          echo -n "$APPLE_CERTIFICATE" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
-            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
-          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
-          rm -f "$RUNNER_TEMP/cert.p12"
-
-      - name: Build
+      - name: Detect Apple signing credentials
+        id: apple
+        # Note what this deliberately does NOT do: define APPLE_CERTIFICATE for
+        # later steps. Tauri runs `security import` itself whenever it sees that
+        # variable, and GitHub sets an absent secret to the empty string rather
+        # than omitting it — so merely mentioning it in a shared env block makes
+        # the bundler try to import an empty certificate and fail.
         env:
-          # Required, not optional: see the check above.
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          if [ -n "$CERT" ]; then
+            echo "signing=true" >> "$GITHUB_OUTPUT"
+            echo "Apple credentials found — the build will be signed and notarized."
+          else
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            echo "No Apple credentials — building unsigned (users allow it once)."
+          fi
+
+      # Two builds, one of which runs. Tauri imports the certificate and
+      # notarizes on its own from these variables; the unsigned path must not
+      # mention them at all.
+      - name: Build, signed and notarized
+        if: steps.apple.outputs.signing == 'true'
+        env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Present only if configured; Tauri signs when it sees an identity and
-          # notarizes when it sees credentials, and skips both otherwise.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri build -- --target universal-apple-darwin
+
+      - name: Build, unsigned
+        if: steps.apple.outputs.signing != 'true'
+        env:
+          # Only the updater key. No Apple variable may appear here, even empty.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --target universal-apple-darwin
 
       - name: Collect the artifacts
