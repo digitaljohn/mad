@@ -6,9 +6,6 @@
 export const IMG_RE = /\.(png|jpe?g|gif|svg|webp|bmp|avif)$/i;
 export const MD_RE = /\.(md|markdown)$/i;
 
-export const isImage = (path: string) => IMG_RE.test(path);
-export const isMarkdown = (path: string) => MD_RE.test(path);
-
 /** Everything before the last separator. `""` for a bare name. */
 export function parentOf(path: string): string {
   const i = path.lastIndexOf("/");

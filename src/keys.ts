@@ -25,6 +25,7 @@ export type KeyAction =
   | { kind: "find" }
   | { kind: "find-replace" }
   | { kind: "search-files" }
+  | { kind: "goto-heading" }
   | { kind: "close-tab" }
   | { kind: "show-diff" }
   | { kind: "toggle-sidebar" }
@@ -59,6 +60,9 @@ export function resolveKey(k: KeyStroke, ctx: KeyContext): KeyAction | null {
     return { kind: "tab-cycle", dir: k.code === "ArrowRight" ? 1 : -1 };
   }
   if (k.code === "KeyK" && !k.shift && !k.alt) return { kind: "palette" };
+  // ⌘⇧= is muscle-memory for zoom in; the menu only registers plain ⌘=,
+  // so this variant is ours to handle even under the native menu.
+  if (k.code === "Equal" && k.shift && !k.alt) return { kind: "zoom", delta: 1 };
 
   if (ctx.native) return null; // the native menu owns everything below
 
@@ -67,6 +71,7 @@ export function resolveKey(k: KeyStroke, ctx: KeyContext): KeyAction | null {
   if (k.code === "KeyF" && k.shift && !k.alt) return { kind: "search-files" };
   if (k.code === "KeyF" && k.alt) return { kind: "find-replace" };
   if (k.code === "KeyF" && !k.shift) return { kind: "find" };
+  if (k.code === "KeyO" && k.shift && !k.alt) return { kind: "goto-heading" };
   if (k.code === "KeyW" && !k.shift && !k.alt) return { kind: "close-tab" };
   if (k.code === "KeyD" && k.shift && !k.alt) return { kind: "show-diff" };
   if (k.code === "Backslash" && !k.shift) return { kind: "toggle-sidebar" };

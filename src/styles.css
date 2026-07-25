@@ -1272,8 +1272,7 @@ body.tauri.sidebar-hidden #topbar {
 }
 
 /* Mermaid diagram preview inside code blocks. */
-.milkdown .milkdown-code-block .preview-panel .preview svg,
-.milkdown .mermaid-preview svg {
+.milkdown .milkdown-code-block .preview-panel .preview svg {
   max-width: 100%;
   height: auto;
   display: block;
