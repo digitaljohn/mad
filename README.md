@@ -1,92 +1,151 @@
 # mad
 
-**A tiny markdown editor that gives your file back the way it found it.**
+**A clean markdown editor for folders full of specs, notes and documentation.**
 
-Built with [Tauri 2](https://v2.tauri.app) and [Milkdown Crepe](https://milkdown.dev),
-dressed in Claude's design tokens, and carrying exactly one strong opinion.
+No build system. No marketplace. No opinions about your JavaScript. Free and open
+source, permanently.
 
-![mad, dark](docs/screenshot-dark.png)
+![mad](docs/screenshot-dark.png)
 
-## Why does this exist
+## Why this exists
 
-Every WYSIWYG markdown editor makes the same promise, and most of them quietly
-break it. You open a note, click around for a minute, and your `-` bullets have
-become `*`, your tight lists have sprouted blank lines, your `---` is now `***`,
-and the alt text on your architecture diagram has been replaced with the string
-`1.00` for reasons known only to a serializer.
+I write hardware specs. In practice that means a folder of markdown files, a heap
+of diagrams and screenshots, and more tables than any reasonable person should
+maintain by hand.
 
-Then you `git diff` and forty lines light up. You changed one word.
+I tried everything. The market splits neatly in two.
 
-mad exists because that is unacceptable in a program whose entire job is holding
-text. There is a test that pushes a document through the rich editor and back out
-again and asserts the bytes are **identical** — headings, tight lists, ordered
-lists, thematic breaks, images with alt text, task lists, blockquotes, tables,
-fenced code. It passes.
+**The beautiful ones.** Gorgeous typography, tasteful little animations, a launch
+video with a lo-fi soundtrack. Also: can't open a folder, treat an image as an
+unwelcome surprise, and have no idea which of your documents you touched since
+Friday. Wonderful for writing a blog post about deep work. Useless for maintaining
+a spec.
 
-Everything else in here — the tabs, the palette, the git badges, the mermaid
-diagrams — is just the equipment you need in order to actually use the thing.
+**The powerful ones.** Which is to say VS Code, or something in a VS Code costume.
+Congratulations, you now have a terminal, a debugger, an extension marketplace,
+twelve panels and a JSON file that configures how the other JSON files behave. You
+wanted to straighten out a table.
 
-## Things we fixed that we should not have had to
+mad is the bit in the middle that nobody had bothered to build. Open a folder.
+Browse the tree. Drop in an image. Drag a table row where it belongs. Glance at the
+sidebar and see what's changed since your last commit. Then it gets out of the way,
+which is the entire job.
 
-Three of these were live bugs in the editor library underneath. All three fire
-the instant you open a file and save it, which is to say: always.
+## Features
 
-| The bug | What it did to your file |
-| --- | --- |
-| The image block stores its zoom level in the markdown `alt` field | `![diagram](x.png)` → `![1.00](x.png)`. Alt text gone. |
-| `bullet_list.spread` is kept as the **string** `"false"`, then handed to mdast unchanged — and `"false"` is truthy | every bullet list serialized *loose*, gaining a blank line between items on every save |
-| remark-stringify's defaults | `-` → `*`, `---` → `***` |
+### Writing
 
-Patched in [`src/editor.ts`](src/editor.ts) by overriding the node schemas
-*after* Crepe registers its own. The duplicate node id wins because Milkdown
-assembles its schema with `Object.fromEntries`, and the parser and serializer
-both read their runners off the final schema — so exactly one spec survives.
-This is documented nowhere. You're welcome.
+Proper WYSIWYG markdown — headings, lists, task lists, quotes, code blocks, links.
+Press `/` for a block menu, select text for a formatting toolbar, or just use the
+shortcuts you already have in your fingers. Flip to raw markdown whenever you stop
+trusting it (`⌘⇧M`), or run a **split view** with source on the left, live preview
+on the right, scrolling in step.
 
-The fourth one was ours: ProseMirror keeps a trailing empty paragraph, so the
-first save of any document used to append a blank line. Now normalized to
-exactly one trailing newline, like a well-raised text file.
+Mermaid diagrams render live inside ` ```mermaid ` fences, for when the spec needs
+a state machine and you'd rather not open a drawing app and start aligning boxes
+with your mouse.
 
-## It also refuses to lose your work
+### Images
 
-- Writes go **temp file → fsync → rename**, with the original's permissions
-  carried across. A full disk or a hard crash cannot truncate a note.
-- Every open file carries an mtime+size stamp. If it changed on disk *and* in the
-  editor, mad asks which version wins rather than picking for you.
-- The workspace is watched. Edit a note in another app and mad reloads it —
-  unless you have unsaved changes, in which case see above.
-- New files are **drafts**. Nothing touches the disk until you choose a location.
-- Delete means the **system Trash**, not `unlink(2)`.
-- Tabs, expanded folders, sidebar width, zoom and window geometry all come back
-  on next launch.
+Paste a screenshot. Drag one in from Finder. Drag one out of the sidebar into the
+document. However it arrives, it's saved **next to the markdown file** and
+referenced with a relative path — because the alternatives are a base64 blob
+wedged into your prose, or a link to a cloud bucket that quietly dies in eighteen
+months. Neither is a documentation strategy. Click any image in the tree to view it
+full size with its dimensions.
 
-## What's in the box
+### Tables
 
-**Editing** — WYSIWYG markdown with tables, images, code blocks, task lists and
-quotes; `/` for a block menu; a selection toolbar. Rich ⇄ raw toggle, or a split
-view with a live preview and synced scrolling. Mermaid diagrams render under
-` ```mermaid ` fences. Find & replace with case and whole-word, plus full-text
-search across every file. A fuzzy command palette. Spell check, text zoom,
-light and dark.
+Tables in raw markdown are a pipe-alignment exercise nobody has ever enjoyed. So:
+build one from the block menu, then reshape it with the handles — drag rows and
+columns into the order you want, set per-column alignment, insert and delete
+without counting anything. What lands on disk is tidy, aligned and diffable.
 
-**Files** — a folder tree with real keyboard navigation, drag-to-move, rename in
-place, duplicate, Reveal in Finder, Copy Path. Paste or drag images straight in
-and they're stored next to the `.md` and referenced relatively. Drag an image out
-of the tree into the document. Export any note as one self-contained HTML file.
+### Seeing what changed
 
-**Git** — if the folder is a repository, changed files get a letter (`M` `A` `U`
-`D` `R` `!`) and a tinted name, and folders containing changes get a dot. It
-shells out to `git status --porcelain`; there is no libgit2 and no polling. It
-refreshes on save, on filesystem events, on `.git` bookkeeping (commit, stage,
-checkout) and when the window regains focus — so committing in a terminal shows
-up when you switch back.
+If the folder is a git repository, the tree and tabs mark themselves up: a letter
+per file (`M` modified, `A` added, `U` untracked, `D` deleted, `R` renamed, `!`
+conflict), the name tinted to match, and a dot on any folder hiding changes further
+down. It updates when you save, when files move on disk, when you commit or stage,
+and whenever the window regains focus — so the commit you made in a terminal thirty
+seconds ago is already on screen.
+
+There is no refresh button. There is no refresh button anywhere in this app. That
+is deliberate.
+
+### Finding things
+
+`⌘P` jumps to any file by fuzzy name. `⌘⇧P` opens a command palette for everything
+else, and typing `#` lists the headings in the current document. `⌘F` searches the
+document with case and whole-word toggles; `⌘⇧F` searches every file in the folder
+at once — in parallel, in Rust — and drops you on the matching line.
+
+### Getting around
+
+Tabs across the top: drag to reorder, `⌘1`–`⌘9` to jump, middle-click to close, and
+a small dot when something's unsaved. The file tree does real keyboard navigation,
+plus rename in place, duplicate, drag-to-move, Reveal in Finder and Copy Path.
+Deleting sends the file to the **system Trash**, not to the void.
+
+A status bar keeps the word count, character count, reading time and cursor
+position where you can see them. There's light and dark, adjustable text size,
+spell check, a sidebar that collapses, and HTML export for the colleague who will
+ask for "just a link I can open".
+
+Quit and it all comes back — open tabs, expanded folders, sidebar width, text size,
+window position. Because reconstructing your workspace every morning is not a
+feature.
 
 <details>
-<summary>Light mode, because some people work in daylight</summary>
+<summary>Light mode, for those who work in daylight</summary>
 
 ![mad, light](docs/screenshot-light.png)
 
 </details>
+
+## Your files stay yours
+
+A spec lives in git for years. Most editors treat that as a charming hypothetical.
+
+Open a document in mad, save it, and the diff contains what you changed. Nothing
+else. Your `-` bullets stay `-`. Tight lists stay tight. `---` stays `---`. The alt
+text on your diagrams survives, which sounds like a low bar right up until you
+discover it isn't. There's a test that pushes a document through the rich editor
+and back out again and asserts the bytes are identical, because a forty-line diff
+from a one-word edit belongs to someone else's genre.
+
+<details>
+<summary>Clearing that bar meant fixing three bugs in the library underneath</summary>
+
+All three fired the instant you opened a file and saved it, which is to say:
+constantly.
+
+- The image block stored its zoom level in the markdown `alt` field, so
+  `![diagram](x.png)` came back as `![1.00](x.png)`. Alt text: gone.
+- `bullet_list.spread` was kept as the string `"false"` and passed to mdast
+  unchanged — and `"false"` is truthy — so every bullet list serialized *loose*,
+  growing a blank line between items on every single save.
+- remark-stringify's defaults helpfully rewrote `-` bullets to `*` and `---` to
+  `***`.
+
+Patched in [`src/editor.ts`](src/editor.ts) by overriding the node schemas *after*
+Crepe registers its own; the duplicate node id wins because Milkdown assembles its
+schema with `Object.fromEntries`. Documented nowhere. You're welcome.
+
+The fourth one was ours: ProseMirror keeps a trailing empty paragraph, which used
+to append a blank line on the first save of every document.
+
+</details>
+
+Nor does it lose work:
+
+- Writes go **temp file → fsync → rename**, carrying the original's permissions
+  across. A full disk or a hard crash cannot truncate a document.
+- Every open file carries an mtime+size stamp. If it changed on disk *and* in the
+  editor, mad asks which version wins rather than picking a winner on your behalf.
+- Edit a file in another app and mad quietly reloads it — unless you have unsaved
+  changes, in which case see above.
+- New files are drafts. Nothing touches the disk until you say where.
 
 ## Shortcuts
 
@@ -112,9 +171,9 @@ npm install
 npm run tauri dev
 ```
 
-`npm run dev` on its own serves the entire UI in a plain browser against an
-in-memory demo workspace — no Rust, no Tauri. Most of the styling was done that
-way, and it's how the screenshots above were taken.
+`npm run dev` on its own serves the whole UI in a plain browser against an
+in-memory demo workspace — no Rust, no Tauri, no waiting. Most of the styling was
+done that way, and it's how the screenshots above were taken.
 
 ```bash
 npm test              # tsc + 23 Rust tests
@@ -138,25 +197,30 @@ src-tauri/
 ```
 
 Two source trees, one app: `src/` runs in the webview, `src-tauri/` is the Rust
-process that owns the filesystem. Despite its name, `src-tauri/` contains no
-Tauri — the framework arrives from crates.io like any other dependency, and
+process that owns the filesystem. Despite its name, `src-tauri/` contains no Tauri
+— the framework arrives from crates.io like any other dependency, and
 `node_modules/` and `target/` are both gitignored. It's simply where Tauri's CLI
 expects your Rust to live, and every doc page it will ever hand you says
 `src-tauri/…`, so it stays put.
 
-The Rust side owns the filesystem and the native menu; there is no `fs` plugin
-and no asset protocol, so the app ships with a real CSP and no wildcard scopes.
-Images cross the IPC bridge as base64 data URLs. The tests live at the bottom of
-`lib.rs` and cover the things that would ruin your day: atomic writes, save
-conflicts, path traversal in image names, porcelain parsing, and a real
-`git init`'d repository.
+The Rust side owns the filesystem and the native menu. There's no `fs` plugin and
+no asset protocol, so the app ships with a real CSP and no wildcard scopes — images
+cross the IPC bridge as base64 data URLs instead. The tests live at the bottom of
+`lib.rs` and cover the things that would actually ruin your afternoon: atomic
+writes, save conflicts, path traversal in image names, git porcelain parsing, and a
+real `git init`'d repository.
 
 ## The name
 
 Short for **ma**rk**d**own. Also an accurate description of how one feels after
 reading a markdown serializer's source code. Both readings are supported.
 
+## Licence
+
+Free and open source, and it is staying that way. There is no pro tier, no seat
+pricing, no "mad for Teams", and nobody will ever email you to ask how your trial
+is going. It's a markdown editor.
+
 ---
 
-<sub>Written with [Claude Code](https://claude.com/claude-code), which also found
-the three upstream bugs by refusing to trust that a round-trip was lossless.</sub>
+<sub>Written with [Claude Code](https://claude.com/claude-code).</sub>
