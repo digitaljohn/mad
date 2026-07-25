@@ -9,26 +9,26 @@ source, permanently.
 
 ## Why this exists
 
-I write hardware specs. In practice that means a folder of markdown files, a heap
-of diagrams and screenshots, and more tables than any reasonable person should
-maintain by hand.
+I work in a hardware team. The documentation lives in markdown — a folder of specs,
+a heap of diagrams and screenshots, and more tables than anyone should maintain by
+hand. The engineers writing it wanted one simple thing: somewhere pleasant to edit
+it all.
 
-I tried everything. The market splits neatly in two.
+Nothing fitted. The market splits neatly in two.
 
 **The beautiful ones.** Gorgeous typography, tasteful little animations, a launch
 video with a lo-fi soundtrack. Also: can't open a folder, treat an image as an
-unwelcome surprise, and have no idea which of your documents you touched since
-Friday. Wonderful for writing a blog post about deep work. Useless for maintaining
-a spec.
+unwelcome surprise, and have no idea which documents were touched since Friday.
+Wonderful for writing a blog post about deep work. Useless for maintaining a spec.
 
 **The powerful ones.** Which is to say VS Code, or something in a VS Code costume.
-Congratulations, you now have a terminal, a debugger, an extension marketplace,
-twelve panels and a JSON file that configures how the other JSON files behave. You
-wanted to straighten out a table.
+Congratulations — the engineer who wanted to straighten out a table now has a
+terminal, a debugger, an extension marketplace, twelve panels and a JSON file that
+configures how the other JSON files behave.
 
-mad is the bit in the middle that nobody had bothered to build. Open a folder.
+So mad is the bit in the middle that nobody had bothered to build. Open a folder.
 Browse the tree. Drop in an image. Drag a table row where it belongs. Glance at the
-sidebar and see what's changed since your last commit. Then it gets out of the way,
+sidebar and see what's changed since the last commit. Then it gets out of the way,
 which is the entire job.
 
 ## Features
