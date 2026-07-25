@@ -223,6 +223,59 @@ fn save_recents(app: &tauri::AppHandle, recents: &[String]) {
     }
 }
 
+// --------------------------------------------------------------- grants
+
+/// Folders the user has ever picked in the folder dialog, remembered so the
+/// scope can be seeded on the next launch.
+///
+/// Deliberately separate from the recents list. "Open Recent ▸ Clear Menu"
+/// clears a *menu*; if that also revoked filesystem access, the next launch
+/// would refuse the workspace the session still points at and the user would
+/// silently lose their folder and every open tab.
+fn grants_file(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    let _ = fs::create_dir_all(&dir);
+    Some(dir.join("granted-folders.json"))
+}
+
+/// Cap on remembered grants. Generous — this is a list of folders someone
+/// deliberately opened — but not unbounded.
+const MAX_GRANTS: usize = 50;
+
+fn read_grants(file: &Path) -> Vec<String> {
+    fs::read_to_string(file)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| Path::new(p).is_dir())
+        .collect()
+}
+
+/// Add `path` to the remembered grants, most-recent first, deduped and capped.
+/// Returns None when it was already the newest entry and nothing need be
+/// written.
+fn push_grant(grants: &mut Vec<String>, path: &str) -> Option<()> {
+    if grants.first().map(String::as_str) == Some(path) {
+        return None;
+    }
+    grants.retain(|p| p != path);
+    grants.insert(0, path.to_string());
+    grants.truncate(MAX_GRANTS);
+    Some(())
+}
+
+/// Record a dialog-granted folder so it survives a restart.
+fn remember_grant(app: &tauri::AppHandle, path: &str) {
+    let Some(file) = grants_file(app) else { return };
+    let mut grants = read_grants(&file);
+    if push_grant(&mut grants, path).is_some() {
+        if let Ok(s) = serde_json::to_string(&grants) {
+            let _ = fs::write(&file, s);
+        }
+    }
+}
+
 // ------------------------------------------------------------------- menu
 
 /// Build (or rebuild) the whole application menu — reading the current recents
@@ -470,6 +523,7 @@ async fn pick_folder(app: tauri::AppHandle) -> Option<String> {
     if let Some(p) = &chosen {
         // The user picked it in a native dialog — that's what a grant is.
         scope().grant_root(p);
+        remember_grant(&app, p); // …and it has to outlive this launch
     }
     chosen
 }
@@ -1424,9 +1478,12 @@ fn git_command(dir: &str, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(dir)
         .args(args)
-        // Paths this app passes are literal file names, never patterns —
-        // without this, discarding "[draft] plan.md" globs, matches nothing
-        // in HEAD, and the file is trashed instead of restored.
+        // Paths this app passes are literal file names, never patterns. Git
+        // treats a pathspec as a glob, so a file genuinely named "a*.md"
+        // makes `git restore` revert every file the wildcard happens to
+        // match — discarding one document silently throws away unsaved edits
+        // to its neighbours. (Brackets usually survive: git tries a literal
+        // match first. It's `*` and `?` that do the damage.)
         .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(std::process::Stdio::null());
     cmd
@@ -1742,12 +1799,16 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            let recents = load_recents(&handle);
-            // Recents seed the scope: every entry was dialog-granted when it
-            // was first opened, and push_recent refuses anything that wasn't.
-            for r in &recents {
-                scope().grant_root(r);
+            // Seed the scope from the remembered grants — folders the user
+            // picked in the folder dialog at some point. Not from the recents
+            // list: that one can be emptied from the menu, and clearing a
+            // menu must not cost you access to the folder you have open.
+            if let Some(f) = grants_file(&handle) {
+                for g in read_grants(&f) {
+                    scope().grant_root(&g);
+                }
             }
+            let recents = load_recents(&handle);
             app.manage(Recents(Mutex::new(recents)));
             app.manage(MenuState {
                 save: Mutex::new(None),
@@ -3063,10 +3124,56 @@ mod tests {
     // -------------------------------------------------- git path literalness
 
     #[test]
-    fn discard_restores_a_committed_file_whose_name_is_a_glob_pattern() {
-        // "[draft] plan.md": as a git pathspec, [draft] is a character class
-        // that matches nothing in HEAD — so without literal pathspecs the file
-        // reads as never-committed and "discard" trashes the whole document.
+    fn clearing_the_recent_menu_does_not_revoke_folder_access() {
+        // The grants list is what seeds the scope on the next launch. If
+        // "Open Recent ▸ Clear Menu" emptied it, the workspace the session
+        // still points at would be refused and the user would lose their
+        // folder and every open tab without being told why.
+        let t = TempDir::new();
+        let grants = t.path().join("granted-folders.json");
+        let recents = t.path().join("recents.json");
+
+        let mut list = Vec::new();
+        push_grant(&mut list, "/work/specs");
+        fs::write(&grants, serde_json::to_string(&list).unwrap()).unwrap();
+        write_recents(&recents, &["/work/specs".to_string()]);
+
+        // Clear Menu empties the recents file…
+        write_recents(&recents, &[]);
+        assert!(read_recents(&recents).is_empty());
+
+        // …and the grant is untouched, so access survives the restart.
+        // (read_grants filters to folders that still exist, so compare the
+        // stored JSON rather than the filtered read.)
+        let stored: Vec<String> =
+            serde_json::from_str(&fs::read_to_string(&grants).unwrap()).unwrap();
+        assert_eq!(stored, vec!["/work/specs".to_string()]);
+    }
+
+    #[test]
+    fn grants_are_deduped_newest_first_and_capped() {
+        let mut g = Vec::new();
+        assert!(push_grant(&mut g, "/a").is_some());
+        assert!(push_grant(&mut g, "/b").is_some());
+        // Re-granting the newest is a no-op — no pointless rewrite per launch.
+        assert!(push_grant(&mut g, "/b").is_none());
+        // Re-granting an older one promotes it.
+        assert!(push_grant(&mut g, "/a").is_some());
+        assert_eq!(g, vec!["/a".to_string(), "/b".to_string()]);
+
+        for i in 0..MAX_GRANTS + 10 {
+            push_grant(&mut g, &format!("/w{i}"));
+        }
+        assert_eq!(g.len(), MAX_GRANTS);
+    }
+
+    #[test]
+    fn discarding_a_wildcard_named_file_leaves_its_neighbours_alone() {
+        // A file genuinely called "a*.md" is a glob as far as git is
+        // concerned: `git restore -- a*.md` reverts EVERY match, so
+        // discarding one document would silently throw away unsaved edits to
+        // "ab.md" sitting next to it. Delete the GIT_LITERAL_PATHSPECS line
+        // and this test fails on the neighbour, which is the whole point.
         let t = TempDir::new();
         let sh = |args: &[&str]| {
             let ok = std::process::Command::new("git")
@@ -3083,14 +3190,22 @@ mod tests {
         sh(&["init", "--quiet", "-b", "main"]);
         sh(&["config", "user.email", "t@example.com"]);
         sh(&["config", "user.name", "t"]);
-        let path = t.write("[draft] plan.md", "committed\n");
+        let star = t.write("a*.md", "committed star\n");
+        let neighbour = t.write("ab.md", "committed neighbour\n");
         sh(&["add", "-A"]);
         sh(&["commit", "--quiet", "-m", "init"]);
-        fs::write(&path, "edited\n").unwrap();
+        fs::write(&star, "edited star\n").unwrap();
+        fs::write(&neighbour, "MY UNSAVED WORK\n").unwrap();
 
-        assert_eq!(run(git_discard_kind(path.clone())), Ok("restore".into()));
-        assert_eq!(run(git_discard(path.clone())), Ok("restored".into()));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "committed\n");
+        assert_eq!(run(git_discard_kind(star.clone())), Ok("restore".into()));
+        assert_eq!(run(git_discard(star.clone())), Ok("restored".into()));
+
+        assert_eq!(fs::read_to_string(&star).unwrap(), "committed star\n");
+        assert_eq!(
+            fs::read_to_string(&neighbour).unwrap(),
+            "MY UNSAVED WORK\n",
+            "discarding “a*.md” reverted an unrelated file"
+        );
     }
 
     #[test]
