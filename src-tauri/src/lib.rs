@@ -649,13 +649,62 @@ async fn set_menu_state(
     });
 }
 
-/// The window the user is looking at. `Manager::get_focused_window` is behind
-/// Tauri's `unstable` feature, so ask the windows themselves.
+/// The window that currently reports focus. `Manager::get_focused_window` is
+/// behind Tauri's `unstable` feature, so ask the windows themselves.
+///
+/// Can legitimately be None: while a native menu is open macOS gives focus to
+/// the menu bar, so at the exact moment a menu item fires, every window may
+/// answer "not me".
 fn focused_label(app: &tauri::AppHandle) -> Option<String> {
     app.webview_windows()
         .into_iter()
         .find(|(_, w)| w.is_focused().unwrap_or(false))
         .map(|(label, _)| label)
+}
+
+/// Which window a menu command is aimed at.
+///
+/// Never returns "all of them". A menu command belongs to exactly one window,
+/// and broadcasting it makes windows anything but standalone — File ▸ Open
+/// Folder fired in every window at once, so picking a folder in one replaced
+/// the workspace in all of them.
+///
+/// The remembered last-focused window is the authority precisely because it
+/// survives the menu bar taking focus; the live check is only a fallback for
+/// the very first command before any focus event has landed.
+fn menu_target(app: &tauri::AppHandle) -> Option<String> {
+    let remembered = app
+        .state::<MenuState>()
+        .focused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let open: Vec<String> = app.webview_windows().into_keys().collect();
+    choose_menu_target(remembered.as_deref(), focused_label(app).as_deref(), &open)
+}
+
+/// The routing rule, separated from Tauri so it can be tested — including the
+/// case that caused the bug, where nothing reports focus. Staging that at
+/// runtime means holding a native menu open, which no test can do.
+fn choose_menu_target(
+    remembered: Option<&str>,
+    focused: Option<&str>,
+    open: &[String],
+) -> Option<String> {
+    let still_open = |l: &str| open.iter().any(|o| o == l);
+    if let Some(l) = remembered.filter(|l| still_open(l)) {
+        return Some(l.to_string());
+    }
+    if let Some(l) = focused.filter(|l| still_open(l)) {
+        return Some(l.to_string());
+    }
+    // Nothing remembered and nothing focused. One window means no ambiguity;
+    // more than one means we genuinely cannot tell, and the only safe answer
+    // is none — firing at all of them is what made windows non-standalone.
+    match open {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// The label for the Nth extra window. Every one of these must be matched by
@@ -2185,20 +2234,14 @@ pub fn run() {
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             // One menu bar drives whichever window is in front: ⌘S must save
-            // *that* document, not fire in every window at once.
-            let to_focused = |ev: &str, payload: Option<i32>| match focused_label(app) {
-                Some(label) => {
+            // *that* document, and File ▸ Open Folder must replace *that*
+            // workspace. If we cannot say which window is meant, we do
+            // nothing — never all of them.
+            let to_focused = |ev: &str, payload: Option<i32>| {
+                if let Some(label) = menu_target(app) {
                     let _ = match payload {
                         Some(p) => app.emit_to(label.as_str(), ev, p),
                         None => app.emit_to(label.as_str(), ev, ()),
-                    };
-                }
-                // No window has focus (menu used with everything minimised):
-                // nothing sensible to target, so let every window decide.
-                None => {
-                    let _ = match payload {
-                        Some(p) => app.emit(ev, p),
-                        None => app.emit(ev, ()),
                     };
                 }
             };
@@ -2248,8 +2291,10 @@ pub fn run() {
                 }
                 "close_window" => {
                     // Through close(), not destroy(): the frontend's
-                    // close-requested flush still runs.
-                    if let Some(w) = focused_label(app).and_then(|l| app.get_webview_window(&l)) {
+                    // close-requested flush still runs. menu_target, not the
+                    // live focus check — with the menu open no window reports
+                    // focus, and ⇧⌘W closing nothing is its own bug.
+                    if let Some(w) = menu_target(app).and_then(|l| app.get_webview_window(&l)) {
                         let _ = w.close();
                     }
                 }
@@ -2268,17 +2313,12 @@ pub fn run() {
                 }
                 other => {
                     if let Some(path) = other.strip_prefix("recent::") {
-                        match focused_label(app) {
-                            Some(label) => {
-                                let _ = app.emit_to(
-                                    label.as_str(),
-                                    "menu-open-recent",
-                                    path.to_string(),
-                                );
-                            }
-                            None => {
-                                let _ = app.emit("menu-open-recent", path.to_string());
-                            }
+                        // Same rule as every other menu command: one window,
+                        // or none. Opening a recent folder in every window at
+                        // once is the bug this whole function exists to avoid.
+                        if let Some(label) = menu_target(app) {
+                            let _ =
+                                app.emit_to(label.as_str(), "menu-open-recent", path.to_string());
                         }
                     }
                 }
@@ -3592,6 +3632,55 @@ mod tests {
         // would let a stale confirmed-set exit the app at the wrong moment.
         let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
         assert!(!everyone_confirmed(&confirmed, &[]));
+    }
+
+    #[test]
+    fn a_menu_command_never_fires_in_more_than_one_window() {
+        let both = vec!["main".to_string(), "mad-2".to_string()];
+
+        // The reported bug: with a native menu open macOS gives focus to the
+        // menu bar, so no window reports focus. The old code broadcast, and
+        // File ▸ Open Folder replaced the workspace in every window at once.
+        // The last-focused window is the answer, and it survives that.
+        assert_eq!(
+            choose_menu_target(Some("mad-2"), None, &both),
+            Some("mad-2".to_string())
+        );
+
+        // Nothing remembered yet (very first command): fall back to live focus.
+        assert_eq!(
+            choose_menu_target(None, Some("main"), &both),
+            Some("main".to_string())
+        );
+
+        // Remembered wins over live focus — it is the window the user was in
+        // when they reached for the menu.
+        assert_eq!(
+            choose_menu_target(Some("main"), Some("mad-2"), &both),
+            Some("main".to_string())
+        );
+
+        // Remembered window has since closed: don't route into the void.
+        assert_eq!(
+            choose_menu_target(Some("mad-9"), Some("mad-2"), &both),
+            Some("mad-2".to_string())
+        );
+
+        // Nothing known and two windows open — genuinely ambiguous. Doing
+        // nothing is the only answer that keeps windows standalone.
+        assert_eq!(choose_menu_target(None, None, &both), None);
+        assert_eq!(
+            choose_menu_target(Some("gone"), Some("also-gone"), &both),
+            None
+        );
+
+        // One window: no ambiguity to protect against.
+        assert_eq!(
+            choose_menu_target(None, None, &["main".to_string()]),
+            Some("main".to_string())
+        );
+        // No windows at all.
+        assert_eq!(choose_menu_target(None, None, &[]), None);
     }
 
     #[test]
