@@ -20,3 +20,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # Grouped like the others. Without this, bumping the four actions the
+      # workflows use opened four separate pull requests in one morning.
+      actions:
+        patterns: ["*"]
