@@ -35,8 +35,11 @@ const names = () =>
   rows().map((r) => r.querySelector(".row-name")?.textContent ?? null);
 const key = (k: string) =>
   container.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
+// The label only — a row may also carry a keyboard hint on the right.
 const menuLabels = () =>
-  [...document.querySelectorAll(".context-menu-item")].map((e) => e.textContent);
+  [...document.querySelectorAll(".context-menu-item")].map(
+    (e) => e.querySelector("span")?.textContent ?? e.textContent,
+  );
 const openMenu = (p: string) =>
   row(p).dispatchEvent(
     new MouseEvent("contextmenu", { bubbles: true, clientX: 10, clientY: 10 }),
@@ -506,6 +509,20 @@ describe("context menu", () => {
     expect(menuLabels()).toContain("Reveal in Finder");
     expect(menuLabels()).toContain("Copy Path");
     expect(menuLabels()).toContain("Delete");
+  });
+
+  it("shows the keyboard equivalents, which is the only place they appear", () => {
+    // ⌘⌫ especially: a bare Backspace used to delete, and nothing else in the
+    // app tells you that it no longer does.
+    openMenu("/w/README.md");
+    const hintFor = (label: string) =>
+      [...document.querySelectorAll(".context-menu-item")]
+        .find((b) => b.querySelector("span")?.textContent === label)
+        ?.querySelector(".context-menu-hint")?.textContent;
+    expect(hintFor("Rename")).toBe("F2");
+    expect(hintFor("Delete")).toBe("⌘⌫");
+    // Rows without a shortcut stay clean.
+    expect(hintFor("Duplicate")).toBeUndefined();
   });
 
   it("offers folder actions instead for a directory", () => {

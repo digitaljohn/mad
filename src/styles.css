@@ -421,40 +421,57 @@ body.tauri.sidebar-hidden #topbar {
 }
 
 /* Cursor-anchored context menu. */
+/* Menu rows are read at a glance, not studied: full-strength text and a
+   compact row. Muted text here reads as disabled, and tall rows make a
+   six-item menu feel like a dialog. */
 .context-menu {
   position: fixed;
   z-index: 1000;
-  min-width: 176px;
-  padding: 5px;
-  border-radius: 10px;
+  min-width: 168px;
+  padding: 4px;
+  border-radius: 8px;
   background: var(--bg-popover);
   box-shadow: var(--shadow-menu);
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 0;
 }
 .context-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
   text-align: left;
   border: none;
   background: transparent;
-  color: var(--text-2);
+  color: var(--text);
   font-family: var(--font-ui);
   font-size: 13px;
-  padding: 6px 10px;
-  border-radius: 6px;
+  line-height: 18px;
+  padding: 4px 9px;
+  border-radius: 5px;
   cursor: pointer;
+  white-space: nowrap;
+}
+/* The keyboard equivalent, quiet enough to ignore while scanning labels. */
+.context-menu-hint {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.context-menu-item:disabled .context-menu-hint {
+  color: inherit;
 }
 .context-menu-item:hover:not(:disabled) {
-  background: var(--hover);
+  background: var(--active);
   color: var(--text);
 }
 .context-menu-item:disabled {
-  opacity: 0.4;
+  color: var(--text-3);
   cursor: default;
 }
 .context-menu-sep {
   height: 1px;
-  margin: 4px 6px;
+  margin: 4px 1px;
   background: var(--border);
 }
 .context-menu-item.danger {

@@ -30,12 +30,15 @@ const openRootMenu = () =>
     new MouseEvent("contextmenu", { bubbles: true, clientX: 5, clientY: 5 }),
   );
 /** Click a menu entry by its exact label. */
+// Match the label span, not the whole button: a row may also carry a
+// keyboard hint, and "Delete⌘⌫" is not what anyone means by "Delete".
+const itemLabel = (b: Element) => b.querySelector("span")?.textContent ?? b.textContent;
 const clickItem = (label: string) => {
   const btn = [...document.querySelectorAll<HTMLButtonElement>(".context-menu-item")].find(
-    (b) => b.textContent === label,
+    (b) => itemLabel(b) === label,
   );
   if (!btn) throw new Error(`no menu item "${label}" in [${
-    [...document.querySelectorAll(".context-menu-item")].map((b) => b.textContent).join(", ")
+    [...document.querySelectorAll(".context-menu-item")].map(itemLabel).join(", ")
   }]`);
   btn.click();
 };
