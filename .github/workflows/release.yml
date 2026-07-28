@@ -40,6 +40,12 @@ jobs:
         # Otherwise a v0.2.0 release can ship a binary that calls itself 0.1.0.
         run: node scripts/set-version.mjs --check "${{ steps.version.outputs.version }}"
 
+      - name: Check the release has notes
+        # Both the release body and the in-app update prompt are generated
+        # from CHANGELOG.md below. Fail here, in seconds, rather than ten
+        # minutes later with a release that cannot say what changed.
+        run: node scripts/release-notes.mjs --check "${{ steps.version.outputs.version }}"
+
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -189,7 +195,10 @@ jobs:
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}"
           URL="$BASE/$(basename "$TAR_FILE")"
           SIG="$(cat "$SIG_FILE")"
-          NOTES="See https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VERSION}"
+          # What the app shows when it offers the update. It renders this in a
+          # native dialog, so it gets the plain-text rendering — markdown would
+          # arrive there as literal asterisks.
+          NOTES="$(node scripts/release-notes.mjs --plain "${VERSION}")"
           # One universal bundle serves every Mac, but the updater looks the
           # platform up by exact target triple — so list all three keys.
           node -e '
@@ -256,7 +265,7 @@ jobs:
             SIGNED_NOTE=""
           fi
           UPDATE_NOTE=$'\n\nAlready running mad? **mad ▸ Check for Updates…** will fetch this for you.'
-          cat > notes.md <<EOF
+          cat > install.md <<EOF
           ## Install
 
           Download \`mad_${VERSION}_universal.dmg\`, open it, and drag **mad** to Applications.
@@ -280,6 +289,14 @@ jobs:
 
           Checksums are in \`SHA256SUMS.txt\`.
           EOF
+          # The notes proper come from CHANGELOG.md — the same source the
+          # update manifest above used — so the release page and the prompt
+          # inside the app can never disagree about what shipped.
+          {
+            node scripts/release-notes.mjs "${VERSION}"
+            echo
+            cat install.md
+          } > notes.md
           # A retry after a half-finished publish must not die on "release
           # already exists" — fall back to (re)uploading the assets into it.
           # `created` records which path we took: only a release this run

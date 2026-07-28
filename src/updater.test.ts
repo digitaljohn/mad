@@ -75,6 +75,31 @@ describe("shortNotes", () => {
   it("copes with no notes at all", () => {
     expect(shortNotes(undefined)).toBe("");
   });
+
+  it("cuts on a line boundary rather than mid-word", () => {
+    const notes = `${"a".repeat(300)}\n• ${"b".repeat(300)}`;
+    expect(shortNotes(notes)).toBe(`${"a".repeat(300)}…`);
+  });
+
+  it("falls back to a word boundary when there is no line to cut on", () => {
+    const notes = `${"word ".repeat(90)}end`;
+    const out = shortNotes(notes);
+    expect(out.endsWith("word…")).toBe(true);
+  });
+
+  it("does not leave a heading dangling with nothing under it", () => {
+    // The real shape: a blank line under the heading, so the cut lands on a
+    // newline *after* the colon rather than on the colon itself.
+    const notes = `${"a".repeat(300)}\n\nFixed:\n\n• ${"b".repeat(300)}`;
+    expect(shortNotes(notes)).toBe(`${"a".repeat(300)}…`);
+  });
+
+  it("ignores a boundary too near the start to be worth honouring", () => {
+    // One early newline, then an unbroken run: cutting at the newline would
+    // throw away 390 of the 400 characters that fit.
+    const out = shortNotes(`a\n${"b".repeat(600)}`);
+    expect(out).toBe(`a\n${"b".repeat(398)}…`);
+  });
 });
 
 describe("checkForUpdates", () => {

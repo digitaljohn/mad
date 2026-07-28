@@ -3,6 +3,61 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
+## 0.2.3 — 2026-07-28
+
+Multiple windows, made genuinely standalone. 0.2.0 shipped the feature; an
+adversarial audit of all 26 cross-window paths found five real couplings
+between windows that are supposed to be independent — two of which could
+destroy unsaved work. All five are fixed here.
+
+### Fixed
+
+- **A menu command could fire in every window at once.** Open Folder in one
+  window opened that folder in both. Commands are routed to the focused
+  window, but when no window reports focus the fallback was to let every
+  window decide — which for standalone windows is precisely wrong. A command
+  now resolves to exactly one window or none: the last-focused window if it
+  is still open, else whichever reports focus now, else the only window,
+  else nothing. `Close Window` had the same flaw inverted — with nothing
+  focused, ⇧⌘W closed nothing at all.
+- **An abandoned quit could quit the app much later, taking a draft with
+  it.** ⌘Q, one window agrees, another declines because it has unsaved
+  changes. The agreement was remembered *forever*; simply closing the first
+  window later made the app conclude every remaining window had agreed, and
+  exit — discarding the draft that had just refused. A tally now only counts
+  while a quit is genuinely being asked about, and declining clears it.
+- **A window could be wedged permanently by a cancelled quit.** After
+  another window cancelled, a window that had already agreed could no longer
+  be closed and never answered another ⌘Q, blocking quit for the whole app.
+  Its re-entrancy guard is now always released.
+- **A new window could open a folder you never picked.** Window names are
+  reused and the session store is shared, so ⇧⌘N could restore whatever a
+  long-gone window had left behind — verified in a live app, where a stale
+  entry still pointed at a workspace closed hours earlier. A new window now
+  starts empty and clears that entry before reading it.
+
+### Changed
+
+- **The right-click menu reads properly.** Its labels used the colour this
+  app reserves for secondary text, which on a popover — where every row is a
+  primary action — looked half-disabled. They are full strength now, rows
+  are 26px rather than 28, and disabled items use the muted colour directly
+  instead of 40% opacity over already-muted text. Rename and Delete show
+  their keyboard equivalents (F2 and ⌘⌫); ⌘⌫ had no other home in the UI
+  since 0.2.0 moved tree deletion off a bare Backspace.
+- **Releases say what changed.** Until now the GitHub release body was
+  install instructions only, and the update prompt inside the app showed a
+  bare link. Both are now generated from this file, and a tag with no
+  changelog entry fails the release in ten seconds instead of publishing
+  something silent.
+
+### Known issue
+
+- Installing an update relaunches the app without asking other windows to
+  save first, so **unsaved edits in windows other than the one that started
+  the update are lost.** Save before updating. The fix belongs with the
+  quit-flow consent it should be sharing, and is next.
+
 ## 0.2.2 — 2026-07-25
 
 Nothing changes in the app. This is a build-toolchain release, published

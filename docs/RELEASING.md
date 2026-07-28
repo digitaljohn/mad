@@ -2,7 +2,15 @@
 
 ## Cutting a release
 
+Write the changelog entry **first** — it is not paperwork, it is the release
+notes. `CHANGELOG.md` is the only place they exist: the GitHub release body and
+the prompt the app shows when it offers the update are both generated from it,
+so a release with no entry is a release that cannot say what changed. CI checks
+for one before it starts building.
+
 ```bash
+$EDITOR CHANGELOG.md                   # add "## 0.2.0 — YYYY-MM-DD"
+node scripts/release-notes.mjs 0.2.0   # read back what will be published
 node scripts/set-version.mjs 0.2.0     # updates all four version files
                                        # (package.json, Cargo.toml, Cargo.lock,
                                        #  tauri.conf.json — the lock is the one
@@ -11,6 +19,10 @@ git commit -am "Release 0.2.0"
 git tag v0.2.0
 git push && git push --tags
 ```
+
+`release-notes.mjs --plain` is the same text flattened for a native dialog,
+which is what goes into `latest.json`; the app shows the first ~400 characters
+of it, so lead with a sentence that says what the release is.
 
 The tag triggers `.github/workflows/release.yml`, which runs the tests, builds a
 **universal** macOS binary (one download for Apple Silicon *and* Intel), and

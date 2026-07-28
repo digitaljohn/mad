@@ -24,11 +24,27 @@ export function progressLine(downloaded: number, total: number | null): string {
   return `Downloading update… ${pct}% of ${formatBytes(total)}`;
 }
 
-/** Trim release notes to something that fits in a dialog. */
+/** Trim release notes to something that fits in a dialog.
+
+    Notes are now real changelog prose — paragraphs and bullets — so the cut
+    lands on the last line that fits, or failing that the last word. A dialog
+    that stops mid-word reads as a bug in the app rather than as an excerpt. */
 export function shortNotes(notes: string | undefined, limit = 400): string {
   if (!notes) return "";
   const text = notes.trim();
-  return text.length <= limit ? text : text.slice(0, limit).trimEnd() + "…";
+  if (text.length <= limit) return text;
+
+  const head = text.slice(0, limit);
+  const line = head.lastIndexOf("\n");
+  const word = head.lastIndexOf(" ");
+  // Only honour a boundary in the second half; one near the start would
+  // throw away most of what fits.
+  const cut = line > limit / 2 ? line : word > limit / 2 ? word : limit;
+  // A heading left dangling by the cut ("Fixed:…", with nothing under it)
+  // reads as a rendering fault rather than as an excerpt — drop it. Trim
+  // first: the cut usually lands *on* the newline the heading ends with.
+  const kept = head.slice(0, cut).trimEnd().replace(/\n+[^\n•]{0,30}:$/, "");
+  return kept.trimEnd() + "…";
 }
 
 let inFlight = false;
