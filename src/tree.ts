@@ -84,6 +84,9 @@ export interface TreeCallbacks {
 
 export interface MenuItem {
   label: string;
+  /** Keyboard equivalent, shown greyed on the right. The only place some of
+      these are discoverable at all. */
+  hint?: string;
   danger?: boolean;
   disabled?: boolean;
   action: () => void;
@@ -108,7 +111,15 @@ export function showContextMenu(x: number, y: number, items: (MenuItem | "-")[])
     el.className = "context-menu-item" + (it.danger ? " danger" : "");
     el.setAttribute("role", "menuitem");
     el.disabled = it.disabled ?? false;
-    el.textContent = it.label;
+    const label = document.createElement("span");
+    label.textContent = it.label;
+    el.appendChild(label);
+    if (it.hint) {
+      const hint = document.createElement("span");
+      hint.className = "context-menu-hint";
+      hint.textContent = it.hint;
+      el.appendChild(hint);
+    }
     el.addEventListener("click", () => {
       dismiss();
       it.action();
@@ -666,7 +677,7 @@ export class FileTree {
       { label: "New File", action: () => this.cb.onNewFile(parentDir) },
       { label: "New Folder", action: () => this.cb.onNewFolder(parentDir) },
       "-",
-      { label: "Rename", action: () => this.startRename(entry.path) },
+      { label: "Rename", hint: "F2", action: () => this.startRename(entry.path) },
       { label: "Duplicate", action: () => void this.duplicate(entry.path) },
       "-",
       {
@@ -686,6 +697,9 @@ export class FileTree {
       "-",
       {
         label: entry.is_dir ? "Delete Folder" : "Delete",
+        // The only place ⌘⌫ is discoverable — a bare Backspace used to do
+        // this, and nothing else announces that it no longer does.
+        hint: "⌘⌫",
         danger: true,
         action: () => this.cb.onDelete(entry.path, entry.is_dir),
       },

@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItem, MenuItemBuilder, SubmenuBuilder};
@@ -649,13 +649,62 @@ async fn set_menu_state(
     });
 }
 
-/// The window the user is looking at. `Manager::get_focused_window` is behind
-/// Tauri's `unstable` feature, so ask the windows themselves.
+/// The window that currently reports focus. `Manager::get_focused_window` is
+/// behind Tauri's `unstable` feature, so ask the windows themselves.
+///
+/// Can legitimately be None: while a native menu is open macOS gives focus to
+/// the menu bar, so at the exact moment a menu item fires, every window may
+/// answer "not me".
 fn focused_label(app: &tauri::AppHandle) -> Option<String> {
     app.webview_windows()
         .into_iter()
         .find(|(_, w)| w.is_focused().unwrap_or(false))
         .map(|(label, _)| label)
+}
+
+/// Which window a menu command is aimed at.
+///
+/// Never returns "all of them". A menu command belongs to exactly one window,
+/// and broadcasting it makes windows anything but standalone — File ▸ Open
+/// Folder fired in every window at once, so picking a folder in one replaced
+/// the workspace in all of them.
+///
+/// The remembered last-focused window is the authority precisely because it
+/// survives the menu bar taking focus; the live check is only a fallback for
+/// the very first command before any focus event has landed.
+fn menu_target(app: &tauri::AppHandle) -> Option<String> {
+    let remembered = app
+        .state::<MenuState>()
+        .focused
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let open: Vec<String> = app.webview_windows().into_keys().collect();
+    choose_menu_target(remembered.as_deref(), focused_label(app).as_deref(), &open)
+}
+
+/// The routing rule, separated from Tauri so it can be tested — including the
+/// case that caused the bug, where nothing reports focus. Staging that at
+/// runtime means holding a native menu open, which no test can do.
+fn choose_menu_target(
+    remembered: Option<&str>,
+    focused: Option<&str>,
+    open: &[String],
+) -> Option<String> {
+    let still_open = |l: &str| open.iter().any(|o| o == l);
+    if let Some(l) = remembered.filter(|l| still_open(l)) {
+        return Some(l.to_string());
+    }
+    if let Some(l) = focused.filter(|l| still_open(l)) {
+        return Some(l.to_string());
+    }
+    // Nothing remembered and nothing focused. One window means no ambiguity;
+    // more than one means we genuinely cannot tell, and the only safe answer
+    // is none — firing at all of them is what made windows non-standalone.
+    match open {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// The label for the Nth extra window. Every one of these must be matched by
@@ -676,16 +725,24 @@ async fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         .map(window_label)
         .find(|l| !taken.contains(l))
         .ok_or("Too many windows are already open")?;
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::default())
-        .title("mad")
-        .inner_size(1240.0, 820.0)
-        .min_inner_size(760.0, 480.0)
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true)
-        .traffic_light_position(tauri::LogicalPosition::new(19.0, 27.0))
-        .disable_drag_drop_handler()
-        .build()
-        .map_err(|e| e.to_string())?;
+    // `fresh` marks this as a brand-new window rather than a restored one.
+    // Labels are recycled, and localStorage is shared, so without it a new
+    // window inherits whatever workspace a long-gone window of the same name
+    // was last showing — a folder the user did not choose.
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App("index.html?fresh=1".into()),
+    )
+    .title("mad")
+    .inner_size(1240.0, 820.0)
+    .min_inner_size(760.0, 480.0)
+    .title_bar_style(tauri::TitleBarStyle::Overlay)
+    .hidden_title(true)
+    .traffic_light_position(tauri::LogicalPosition::new(19.0, 27.0))
+    .disable_drag_drop_handler()
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2072,8 +2129,26 @@ struct ExitFlow(Arc<ExitFlowState>);
 #[derive(Default)]
 struct ExitFlowState {
     generation: AtomicUsize,
+    /// Is a quit actually being asked about right now? Without this, the
+    /// `confirmed` set outlives the attempt that filled it, and merely
+    /// *closing* a window later satisfies "everyone agreed" — quitting the
+    /// app and taking another window's unsaved draft with it.
+    in_flight: AtomicBool,
     acked: Mutex<HashSet<String>>,
     confirmed: Mutex<HashSet<String>>,
+}
+
+impl ExitFlowState {
+    /// Abandon the current attempt. A window that declines cancels the quit
+    /// for everyone, which is what declining has always meant.
+    fn stand_down(&self) {
+        self.in_flight.store(false, Ordering::SeqCst);
+        self.acked.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.confirmed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }
 
 /// Should the exit backstop force-quit? Only when its own attempt is still
@@ -2101,6 +2176,11 @@ fn everyone_confirmed(confirmed: &HashSet<String>, open: &[String]) -> bool {
 #[tauri::command]
 fn confirm_exit(app: tauri::AppHandle, window: tauri::Window) {
     let st = app.state::<ExitFlow>().0.clone();
+    // Only meaningful while a quit is being asked about. A late answer from
+    // an abandoned attempt must not accumulate towards a future exit.
+    if !st.in_flight.load(Ordering::SeqCst) {
+        return;
+    }
     let open: Vec<String> = app.webview_windows().into_keys().collect();
     let done = {
         let mut confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
@@ -2110,6 +2190,14 @@ fn confirm_exit(app: tauri::AppHandle, window: tauri::Window) {
     if done {
         app.exit(0);
     }
+}
+
+/// A window declined the quit (an unsaved draft it wants to keep). One "no"
+/// cancels the attempt for everyone, and — crucially — clears the tally, so
+/// nothing left over can quit the app later.
+#[tauri::command]
+fn exit_declined(app: tauri::AppHandle) {
+    app.state::<ExitFlow>().0.stand_down();
 }
 
 /// First thing a window calls on `flush-and-exit`: proves the webview is
@@ -2185,20 +2273,14 @@ pub fn run() {
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             // One menu bar drives whichever window is in front: ⌘S must save
-            // *that* document, not fire in every window at once.
-            let to_focused = |ev: &str, payload: Option<i32>| match focused_label(app) {
-                Some(label) => {
+            // *that* document, and File ▸ Open Folder must replace *that*
+            // workspace. If we cannot say which window is meant, we do
+            // nothing — never all of them.
+            let to_focused = |ev: &str, payload: Option<i32>| {
+                if let Some(label) = menu_target(app) {
                     let _ = match payload {
                         Some(p) => app.emit_to(label.as_str(), ev, p),
                         None => app.emit_to(label.as_str(), ev, ()),
-                    };
-                }
-                // No window has focus (menu used with everything minimised):
-                // nothing sensible to target, so let every window decide.
-                None => {
-                    let _ = match payload {
-                        Some(p) => app.emit(ev, p),
-                        None => app.emit(ev, ()),
                     };
                 }
             };
@@ -2248,8 +2330,10 @@ pub fn run() {
                 }
                 "close_window" => {
                     // Through close(), not destroy(): the frontend's
-                    // close-requested flush still runs.
-                    if let Some(w) = focused_label(app).and_then(|l| app.get_webview_window(&l)) {
+                    // close-requested flush still runs. menu_target, not the
+                    // live focus check — with the menu open no window reports
+                    // focus, and ⇧⌘W closing nothing is its own bug.
+                    if let Some(w) = menu_target(app).and_then(|l| app.get_webview_window(&l)) {
                         let _ = w.close();
                     }
                 }
@@ -2268,17 +2352,12 @@ pub fn run() {
                 }
                 other => {
                     if let Some(path) = other.strip_prefix("recent::") {
-                        match focused_label(app) {
-                            Some(label) => {
-                                let _ = app.emit_to(
-                                    label.as_str(),
-                                    "menu-open-recent",
-                                    path.to_string(),
-                                );
-                            }
-                            None => {
-                                let _ = app.emit("menu-open-recent", path.to_string());
-                            }
+                        // Same rule as every other menu command: one window,
+                        // or none. Opening a recent folder in every window at
+                        // once is the bug this whole function exists to avoid.
+                        if let Some(label) = menu_target(app) {
+                            let _ =
+                                app.emit_to(label.as_str(), "menu-open-recent", path.to_string());
                         }
                     }
                 }
@@ -2315,7 +2394,8 @@ pub fn run() {
             watch_folder,
             new_window,
             confirm_exit,
-            exit_ack
+            exit_ack,
+            exit_declined
         ])
         .on_window_event(|window, event| {
             let app = window.app_handle();
@@ -2342,10 +2422,13 @@ pub fn run() {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&label);
                     // A window closing during ⌘Q can be the last answer the
-                    // quit was waiting on — re-check rather than hang.
+                    // quit was waiting on — re-check rather than hang. Only
+                    // while a quit is genuinely in flight: otherwise simply
+                    // closing a window would satisfy a stale tally and take
+                    // the whole app (and another window's draft) with it.
                     let st = app.state::<ExitFlow>().0.clone();
                     let open: Vec<String> = app.webview_windows().into_keys().collect();
-                    let done = {
+                    let done = st.in_flight.load(Ordering::SeqCst) && {
                         let confirmed = st.confirmed.lock().unwrap_or_else(|e| e.into_inner());
                         !confirmed.is_empty() && everyone_confirmed(&confirmed, &open)
                     };
@@ -2370,13 +2453,10 @@ pub fn run() {
                     api.prevent_exit();
                     let st = app.state::<ExitFlow>().0.clone();
                     let gen = st.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                    st.acked.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                    st.confirmed
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clear();
-                    // Every window flushes its own document and answers; the
-                    // app exits when the last one agrees.
+                    st.stand_down(); // clear any previous attempt's tally…
+                    st.in_flight.store(true, Ordering::SeqCst); // …then open this one
+                                                                // Every window flushes its own document and answers; the
+                                                                // app exits when the last one agrees.
                     let _ = app.emit("flush-and-exit", ());
                     // Backstop for webviews that never answer at all (dead,
                     // hung, or not yet loaded — no user edits can exist then).
@@ -3592,6 +3672,98 @@ mod tests {
         // would let a stale confirmed-set exit the app at the wrong moment.
         let confirmed: HashSet<String> = ["main".to_string()].into_iter().collect();
         assert!(!everyone_confirmed(&confirmed, &[]));
+    }
+
+    #[test]
+    fn an_abandoned_quit_cannot_quit_the_app_later() {
+        // The bug: ⌘Q, window A agrees, window B declines. A's agreement sat
+        // in `confirmed` forever. Later the user merely CLOSES window A — the
+        // Destroyed handler saw "everyone still open has agreed" and exited
+        // the app, taking window B's unsaved draft with it.
+        let st = ExitFlowState::default();
+
+        // A quit opens, window A agrees, window B declines.
+        st.in_flight.store(true, Ordering::SeqCst);
+        st.confirmed.lock().unwrap().insert("main".to_string());
+        st.stand_down();
+
+        assert!(
+            !st.in_flight.load(Ordering::SeqCst),
+            "declining must close the attempt"
+        );
+        assert!(
+            st.confirmed.lock().unwrap().is_empty(),
+            "the tally must not outlive the attempt it belonged to"
+        );
+
+        // Which is what the Destroyed handler now keys on: no attempt open,
+        // so closing a window is just closing a window.
+        assert!(!st.in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_fresh_quit_starts_from_an_empty_tally() {
+        let st = ExitFlowState::default();
+        st.in_flight.store(true, Ordering::SeqCst);
+        st.acked.lock().unwrap().insert("mad-2".to_string());
+        st.confirmed.lock().unwrap().insert("mad-2".to_string());
+
+        // What ExitRequested does: clear, then open.
+        st.stand_down();
+        st.in_flight.store(true, Ordering::SeqCst);
+
+        assert!(st.acked.lock().unwrap().is_empty());
+        assert!(st.confirmed.lock().unwrap().is_empty());
+        assert!(st.in_flight.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_menu_command_never_fires_in_more_than_one_window() {
+        let both = vec!["main".to_string(), "mad-2".to_string()];
+
+        // The reported bug: with a native menu open macOS gives focus to the
+        // menu bar, so no window reports focus. The old code broadcast, and
+        // File ▸ Open Folder replaced the workspace in every window at once.
+        // The last-focused window is the answer, and it survives that.
+        assert_eq!(
+            choose_menu_target(Some("mad-2"), None, &both),
+            Some("mad-2".to_string())
+        );
+
+        // Nothing remembered yet (very first command): fall back to live focus.
+        assert_eq!(
+            choose_menu_target(None, Some("main"), &both),
+            Some("main".to_string())
+        );
+
+        // Remembered wins over live focus — it is the window the user was in
+        // when they reached for the menu.
+        assert_eq!(
+            choose_menu_target(Some("main"), Some("mad-2"), &both),
+            Some("main".to_string())
+        );
+
+        // Remembered window has since closed: don't route into the void.
+        assert_eq!(
+            choose_menu_target(Some("mad-9"), Some("mad-2"), &both),
+            Some("mad-2".to_string())
+        );
+
+        // Nothing known and two windows open — genuinely ambiguous. Doing
+        // nothing is the only answer that keeps windows standalone.
+        assert_eq!(choose_menu_target(None, None, &both), None);
+        assert_eq!(
+            choose_menu_target(Some("gone"), Some("also-gone"), &both),
+            None
+        );
+
+        // One window: no ambiguity to protect against.
+        assert_eq!(
+            choose_menu_target(None, None, &["main".to_string()]),
+            Some("main".to_string())
+        );
+        // No windows at all.
+        assert_eq!(choose_menu_target(None, None, &[]), None);
     }
 
     #[test]

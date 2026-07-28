@@ -58,6 +58,12 @@ async function init() {
     : "main";
   const isMainWindow = winLabel === "main";
   const SESSION = sessionKey(winLabel);
+  // A window opened just now starts empty. Window labels are recycled and
+  // localStorage is shared, so a restored session under this label belongs to
+  // some earlier window, not to this one — restoring it would silently open a
+  // workspace the user never picked.
+  const isFreshWindow = new URLSearchParams(location.search).has("fresh");
+  if (isFreshWindow) clearSession(localStorage, SESSION);
   const saved = loadSession(localStorage, SESSION);
 
   const welcome = $("welcome");
@@ -1720,26 +1726,32 @@ async function init() {
     // No wall-clock cap: the flush may legitimately sit on a native dialog
     // (draft warning, save conflict) for as long as the user ponders it; the
     // Rust backstop only covers a webview that never answers at all.
+    // Guards against a *concurrent* second settle only — two fast ⌘Qs must
+    // not stack two dialogs. It is always released again, including on the
+    // success path: this window may have agreed to a quit that another window
+    // then cancelled, and a latch left set there made this window permanently
+    // unclosable and blocked every future ⌘Q for the whole app.
     let settling = false;
     const settle = async (verb: string): Promise<boolean> => {
       if (settling) return false; // one dialog, one flush, however many asks
       settling = true;
-      // localStorage is synchronous — the session survives even a hung flush.
-      clearTimeout(sessionTimer);
-      persistSession(localStorage, buildSession(), SESSION);
-      // Warn before losing an unsaved draft (drafts never autosave).
-      if (hasUnsavedDraft()) {
-        const proceed = await backend.confirm(
-          "Unsaved file",
-          `You have an unsaved file that will be lost. ${verb} without saving?`,
-        );
-        if (!proceed) {
-          settling = false; // stand down — nothing is pending on the Rust side
-          return false;
+      try {
+        // localStorage is synchronous — the session survives a hung flush.
+        clearTimeout(sessionTimer);
+        persistSession(localStorage, buildSession(), SESSION);
+        // Warn before losing an unsaved draft (drafts never autosave).
+        if (hasUnsavedDraft()) {
+          const proceed = await backend.confirm(
+            "Unsaved file",
+            `You have an unsaved file that will be lost. ${verb} without saving?`,
+          );
+          if (!proceed) return false;
         }
+        await editor.flush();
+        return true;
+      } finally {
+        settling = false;
       }
-      await editor.flush();
-      return true;
     };
 
     // ⌘Q: every window settles and answers; the app exits once the last one
@@ -1750,9 +1762,11 @@ async function init() {
       // fresh backstop, and each one must learn this webview is alive.
       void invoke("exit_ack").catch(() => {});
       if (await settle("Quit")) {
-        void invoke("confirm_exit").catch(() => {
-          settling = false; // IPC failed — allow another attempt over wedging
-        });
+        void invoke("confirm_exit").catch(() => {});
+      } else {
+        // Declining cancels the quit for everyone — and clears the tally, so
+        // no leftover agreement can quit the app at some later moment.
+        void invoke("exit_declined").catch(() => {});
       }
     });
 
@@ -1772,7 +1786,6 @@ async function init() {
         if (!isMainWindow) clearSession(localStorage, SESSION);
         await thisWindow.destroy();
       } catch (err) {
-        settling = false; // let them try again
         toastError("Couldn’t close this window", err);
       }
     });
