@@ -1720,6 +1720,22 @@ async function init() {
     const { listen } = await import("@tauri-apps/api/event");
     const { invoke } = await import("@tauri-apps/api/core");
 
+    // Addressed to THIS window, and nowhere else.
+    //
+    // `listen()` with no target registers `EventTarget::Any`, and an Any
+    // listener short-circuits the emit filter outright — tauri's
+    // listener.rs reads `*target == EventTarget::Any || filter(..)`. So a
+    // Rust-side `emit_to("mad-2", ..)` is delivered to *every* window that
+    // listened without naming one, and picking the right window in
+    // `menu_target()` achieves nothing: the label is discarded one layer
+    // later. That is why Open Folder opened the folder everywhere.
+    //
+    // Naming the label registers `AnyLabel { label }`, which the filter
+    // matches against the emit's own `AnyLabel { label }`. Events that are
+    // *meant* for every window (flush-and-exit, prefs-changed) deliberately
+    // stay unscoped below.
+    const mine = { target: winLabel };
+
     // Put this window's work safely on disk, asking about anything that would
     // be lost. Resolves false if the user decided to stay.
     //
@@ -1817,13 +1833,19 @@ async function init() {
       "menu-show-changes": () => activePath && void showDiff(activePath),
       "menu-check-updates": () => runUpdateCheck(false),
     };
-    for (const [event, run] of Object.entries(menu)) void listen(event, run);
-    void listen<number>("menu-zoom", (e) => zoom(e.payload));
-    void listen<string>("menu-open-recent", (e) => void openRecent(e.payload));
+    for (const [event, run] of Object.entries(menu)) void listen(event, run, mine);
+    void listen<number>("menu-zoom", (e) => zoom(e.payload), mine);
+    void listen<string>(
+      "menu-open-recent",
+      (e) => void openRecent(e.payload),
+      mine,
+    );
 
-    void listen("root-gone", () => void onRootGone());
+    void listen("root-gone", () => void onRootGone(), mine);
 
     // The workspace changed underneath us (another app, a sync client, git…).
+    // Scoped like the rest: this is *our* watcher reporting on *our* folder,
+    // and unscoped it made one window's edits reload another window's tabs.
     void listen<{ dirs: string[]; paths: string[]; bulk: boolean; git: boolean }>(
       "fs-change",
       (e) => {
@@ -1832,6 +1854,7 @@ async function init() {
         if (e.payload.paths.length) void editor.checkExternalChange();
         refreshGit();
       },
+      mine,
     );
 
     // A shared preference changed in another window — adopt it.
