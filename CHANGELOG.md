@@ -3,6 +3,28 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
+## 0.2.4 — 2026-07-30
+
+### Fixed
+
+- **Windows were still acting on each other's commands.** Open Folder in one
+  window opened that folder in every window — the same symptom 0.2.3 claimed
+  to fix, from a different cause one layer down. Commands *were* being
+  addressed to a single window correctly; the address was then discarded on
+  arrival. A listener that doesn't name a window registers for `Any` target,
+  and an `Any` listener bypasses the delivery filter entirely — so a message
+  sent to one window was handed to all of them. Every window-scoped listener
+  now names its own window.
+
+  The same fault, quieter, applied to file watching: a change under one
+  window's folder reloaded tabs and refreshed git badges in the others, and a
+  deleted workspace sent every window back to Welcome rather than the one
+  that lost its folder. ⌘Q and theme changes are still deliberately app-wide.
+
+  0.2.3's fix was real but incomplete, and the test that covered it could not
+  have caught this: it checks which window a command is *addressed* to, which
+  was already right. There is now a test on the delivery side too.
+
 ## 0.2.3 — 2026-07-28
 
 Multiple windows, made genuinely standalone. 0.2.0 shipped the feature; an
