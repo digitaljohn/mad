@@ -24,21 +24,21 @@
   },
   "dependencies": {
     "@leeoniya/ufuzzy": "^1.0.19",
-    "@milkdown/crepe": "^7.21.3",
+    "@milkdown/crepe": "^7.22.0",
     "@milkdown/kit": "^7.21.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-updater": "^2.10.1",
-    "mermaid": "^11.16.0",
+    "mermaid": "^11.16.1",
     "prosemirror-search": "^1.1.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@vitest/coverage-v8": "^4.1.10",
-    "jsdom": "^29.1.1",
+    "jsdom": "^30.0.1",
     "typescript": "~7.0.2",
-    "vite": "^8.1.5",
+    "vite": "^8.2.0",
     "vitest": "^4.1.10"
   }
 }
