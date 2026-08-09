@@ -109,6 +109,15 @@ function decodeHref(s: string): string {
   }
 }
 
+/**
+ * Does pasted text look like a URL worth turning into a link? One token,
+ * an http(s) scheme and a host — nothing that would surprise someone who
+ * pasted a sentence that merely contains a colon.
+ */
+export function looksLikeUrl(text: string): boolean {
+  return /^https?:\/\/\S+$/i.test(text.trim());
+}
+
 /** Escape a string for literal use inside a RegExp. */
 export function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

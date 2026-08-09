@@ -28,14 +28,18 @@ export interface PaletteProviders {
   commands: () => PaletteItem[];
   /** `#` mode — headings in the current document. */
   outline: () => PaletteItem[];
+  /** `##` mode — headings across every file in the workspace. */
+  headings: () => Promise<PaletteItem[]> | PaletteItem[];
 }
 
-type Mode = "files" | "commands" | "outline";
+type Mode = "files" | "commands" | "outline" | "headings" | "pick";
 
 const PLACEHOLDER: Record<Mode, string> = {
   files: "Search files and commands",
   commands: "Run a command",
   outline: "Go to a heading",
+  headings: "Go to a heading in any file",
+  pick: "",
 };
 
 export class CommandPalette {
@@ -75,14 +79,20 @@ export class CommandPalette {
     this.input.addEventListener("keydown", (e) => this.onKey(e));
   }
 
+  /** When set, the palette is a one-shot chooser over exactly these items. */
+  private oneShot: PaletteItem[] | null = null;
+
   private modeOf(value: string): { mode: Mode; needle: string } {
+    if (this.oneShot) return { mode: "pick", needle: value.trim() };
     if (value.startsWith(">")) return { mode: "commands", needle: value.slice(1).trim() };
+    if (value.startsWith("##")) return { mode: "headings", needle: value.slice(2).trim() };
     if (value.startsWith("#")) return { mode: "outline", needle: value.slice(1).trim() };
     return { mode: "files", needle: value.trim() };
   }
 
   /** Open the palette. `seed` sets the initial input (e.g. ">" or "#"). */
   async show(seed = "") {
+    this.oneShot = null;
     this.open = true;
     this.cache.clear(); // fresh data each open
     this.el.classList.remove("hidden");
@@ -91,8 +101,23 @@ export class CommandPalette {
     await this.refresh();
   }
 
+  private pickPlaceholder = "";
+
+  /** Open as a one-shot chooser: no mode prefixes, just these items. */
+  async pick(items: PaletteItem[], placeholder: string) {
+    this.oneShot = items;
+    this.pickPlaceholder = placeholder;
+    this.open = true;
+    this.cache.clear();
+    this.el.classList.remove("hidden");
+    this.input.value = "";
+    this.input.focus();
+    await this.refresh();
+  }
+
   close() {
     this.open = false;
+    this.oneShot = null;
     this.el.classList.add("hidden");
     this.input.value = "";
     this.listEl.innerHTML = "";
@@ -103,15 +128,17 @@ export class CommandPalette {
   }
 
   private async loadItems(mode: Mode): Promise<PaletteItem[]> {
+    if (mode === "pick") return this.oneShot ?? [];
     if (mode === "commands") return this.providers.commands();
     if (mode === "outline") return this.providers.outline();
+    if (mode === "headings") return this.providers.headings();
     return this.providers.files();
   }
 
   private async refresh() {
     const value = this.input.value;
     const { mode, needle } = this.modeOf(value);
-    this.input.placeholder = PLACEHOLDER[mode];
+    this.input.placeholder = mode === "pick" ? this.pickPlaceholder : PLACEHOLDER[mode];
     const myToken = ++this.token;
     // Load the mode's items once per open; reuse for subsequent keystrokes.
     if (!this.cache.has(mode)) {

@@ -10,6 +10,7 @@
     "core:default",
     "core:window:allow-start-dragging",
     "core:window:allow-destroy",
+    "core:webview:allow-print",
     "opener:default",
     "updater:default",
     "process:allow-restart"

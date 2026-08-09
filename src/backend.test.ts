@@ -253,6 +253,29 @@ describe("searchFiles", () => {
     expect((await be.searchFiles("/demo", "   ", opts)).hits).toEqual([]);
   });
 
+  it("skipFenced drops code lines but keeps real headings", async () => {
+    await be.writeFile(
+      "/demo/fenced.md",
+      "# Real\n```bash\n# a comment\n```\n~~~\n# tilde fenced\n~~~\n## Also real\n",
+      null,
+    );
+    const skipped = await be.searchFiles("/demo", "^#{1,6} ", {
+      regex: true,
+      caseSensitive: false,
+      wholeWord: false,
+      skipFenced: true,
+    });
+    const texts = skipped.hits.filter((h) => h.rel === "fenced.md").map((h) => h.text);
+    expect(texts).toEqual(["# Real", "## Also real"]);
+    // Off by default: plain search still sees inside fences.
+    const plain = await be.searchFiles("/demo", "^#{1,6} ", {
+      regex: true,
+      caseSensitive: false,
+      wholeWord: false,
+    });
+    expect(plain.hits.filter((h) => h.rel === "fenced.md")).toHaveLength(4);
+  });
+
   it("honours case sensitivity", async () => {
     const insensitive = await be.searchFiles("/demo", "ideas", opts);
     const sensitive = await be.searchFiles("/demo", "ideas", {

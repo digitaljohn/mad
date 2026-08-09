@@ -3,7 +3,72 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
-## 0.2.4 — 2026-07-30
+## 0.3.0 — unreleased
+
+The round-trip promise, actually kept — plus the features a folder-of-specs
+editor was missing.
+
+### Fixed
+
+- **Syntax the rich editor couldn't parse was silently corrupted on the first
+  edit.** Seven cases, all confirmed against real documents, all fixed:
+
+  - **YAML front matter** parsed as a thematic break plus a heading, so
+    `title: x` metadata was destroyed on save. The `---` block (and Obsidian/
+    Jekyll/Hugo metadata generally) is now carried around the rich editor
+    byte-for-byte; a quiet banner says so, and the Markdown view edits it
+    directly.
+  - **Math.** `$x_i$` became `$x\_i$` — corrupted for GitHub, Obsidian and
+    every other renderer. Crepe's Latex feature (the one feature mad turned
+    off) is now on: dollar-math renders in the editor and round-trips
+    byte-identically, `$$` blocks included.
+  - **Wikilinks.** `[[Page]]` became `\[\[Page]]` — one edit in mad could
+    break every link in an Obsidian vault. Unescaped on save.
+  - **GitHub alerts.** `> [!NOTE]` became `> \[!NOTE]`, de-fanging the alert
+    on GitHub. Unescaped on save.
+  - **Code fence info strings.** ` ```js title="x" {1,3} ` lost everything
+    after the language — Docusaurus and MkDocs attributes gone. The full info
+    string now survives.
+  - **Subscript tildes.** `H~2~O` parsed as strikethrough and re-serialized
+    as `H~~2~~O`. Single tildes are plain text now (GitHub requires `~~`
+    anyway).
+  - **`[toc]`** became `\[toc]`. Unescaped on save.
+
+  Two-space hard breaks also survive as written instead of being rewritten to
+  backslash breaks (and vice versa) — each break remembers its spelling.
+
+- **Heading anchors now match GitHub.** Ids used to keep punctuation
+  (`#foo:-bar!`), so anchors written for github.com 404'd in mad and links
+  written in mad 404'd on GitHub. Both directions now agree (`#foo-bar`).
+
+- **First launch follows the system appearance.** A light-mode Mac used to get
+  a dark editor until it found the toggle. The first explicit toggle still
+  wins permanently.
+
+- **An unsaved draft now survives quit, crash and relaunch.** Drafts were the
+  one thing "quit and it all comes back" didn't cover — their text now rides
+  in the session, so the quit-time "will be lost" warning is gone except where
+  it's still true (closing an extra window discards that window's session).
+
+### Added
+
+- **Outline panel.** The document's headings in the sidebar, click to jump,
+  live as you type. View ▸ Toggle Outline, or from the command palette.
+- **Workspace heading search.** `##` in the palette lists every heading in
+  every file — the folder of specs as one navigable document.
+- **Insert Link to File…** picks a workspace file and inserts a relative link
+  at the caret, label prefilled, `../` arithmetic done for you.
+- **Paste a URL onto selected text** to link it, instead of replacing the
+  text with the URL.
+- **Regex in the document find bar** (`.*` toggle) — find in files already
+  had one; now both do.
+- **Print.** File ▸ Print… with proper print styling — paper colors either
+  way, no app chrome — which also makes the system dialog's "Save as PDF" the
+  PDF export.
+- **Quick Open knows your recent files.** With nothing typed, the files you
+  had open most recently come first.
+- **Cursor and scroll survive.** Switching tabs and relaunching both put you
+  back where you were, not at the top of the file.
 
 ### Fixed
 

@@ -30,6 +30,7 @@ const type = async (value: string) => {
 let files: PaletteItem[];
 let commands: PaletteItem[];
 let outline: PaletteItem[];
+let headings: PaletteItem[];
 let palette: CommandPalette;
 
 beforeEach(() => {
@@ -43,10 +44,15 @@ beforeEach(() => {
     item("Save As…", { subtitle: "⌘⇧S", icon: ICON_COMMAND }),
   ];
   outline = [item("Tables", { subtitle: "H2", icon: ICON_HEADING })];
+  headings = [
+    item("Rollout plan", { subtitle: "H2 · specs/deploy.md", icon: ICON_HEADING }),
+    item("Tables", { subtitle: "H2 · guide.md", icon: ICON_HEADING }),
+  ];
   palette = new CommandPalette({
     files: () => files,
     commands: () => commands,
     outline: () => outline,
+    headings: () => headings,
   });
 });
 
@@ -100,6 +106,24 @@ describe("modes", () => {
     expect(titles()).toEqual(["Tables"]);
   });
 
+  it("switches to workspace headings on ##", async () => {
+    await palette.show("##");
+    expect(titles()).toEqual(["Rollout plan", "Tables"]);
+  });
+
+  it("## must win over # even though both prefixes match", async () => {
+    await palette.show("#");
+    expect(titles()).toEqual(["Tables"]);
+    await type("##");
+    expect(titles()).toEqual(["Rollout plan", "Tables"]);
+  });
+
+  it("filters workspace headings by the text after ##", async () => {
+    await palette.show("##");
+    await type("##roll");
+    expect(titles()).toEqual(["Rollout plan"]);
+  });
+
   it("changes the placeholder with the mode", async () => {
     await palette.show();
     const filesPlaceholder = input().placeholder;
@@ -112,6 +136,42 @@ describe("modes", () => {
     await type(">save");
     expect(titles()).toEqual(["Save As…"]);
     await type("");
+    expect(titles()).toEqual(["welcome", "ideas", "2026-07-23"]);
+  });
+});
+
+describe("one-shot pick", () => {
+  const pickItems = () => [
+    item("alpha", { subtitle: "docs" }),
+    item("beta", { subtitle: "specs" }),
+  ];
+
+  it("shows exactly the given items with the given placeholder", async () => {
+    await palette.pick(pickItems(), "Link to which file?");
+    expect(titles()).toEqual(["alpha", "beta"]);
+    expect(input().placeholder).toBe("Link to which file?");
+  });
+
+  it("mode prefixes are plain text while picking", async () => {
+    const items = [item(">weird name"), item("#hash")];
+    await palette.pick(items, "pick");
+    await type(">weird");
+    expect(titles()).toEqual([">weird name"]);
+    expect(input().placeholder).toBe("pick");
+  });
+
+  it("runs the chosen item and closes", async () => {
+    const items = pickItems();
+    await palette.pick(items, "pick");
+    key("Enter");
+    expect(items[0].run).toHaveBeenCalledOnce();
+    expect(palette.isOpen).toBe(false);
+  });
+
+  it("a later show() leaves pick mode behind", async () => {
+    await palette.pick(pickItems(), "pick");
+    palette.close();
+    await palette.show();
     expect(titles()).toEqual(["welcome", "ideas", "2026-07-23"]);
   });
 });
@@ -304,6 +364,7 @@ describe("data loading", () => {
       files: filesProvider,
       commands: () => commands,
       outline: () => outline,
+      headings: () => [],
     });
     await palette.show();
     await type("i");
@@ -318,6 +379,7 @@ describe("data loading", () => {
       files: filesProvider,
       commands: () => commands,
       outline: () => outline,
+      headings: () => [],
     });
     await palette.show();
     palette.close();
@@ -330,6 +392,7 @@ describe("data loading", () => {
       files: async () => files,
       commands: () => commands,
       outline: () => outline,
+      headings: () => [],
     });
     await palette.show();
     expect(titles()).toEqual(["welcome", "ideas", "2026-07-23"]);
@@ -342,6 +405,7 @@ describe("data loading", () => {
       files: () => new Promise<PaletteItem[]>((r) => (release = r)),
       commands: () => commands,
       outline: () => outline,
+      headings: () => [],
     });
     const showing = palette.show();
     palette.close();
