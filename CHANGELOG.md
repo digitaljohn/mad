@@ -41,6 +41,14 @@ editor was missing.
   (`#foo:-bar!`), so anchors written for github.com 404'd in mad and links
   written in mad 404'd on GitHub. Both directions now agree (`#foo-bar`).
 
+- **View ▸ Zoom now actually resizes the document.** The zoom scaled the
+  editor container, but Crepe's stylesheet pins every paragraph and heading
+  to a fixed pixel size, so the text ignored it — the toast moved, the words
+  didn't. Paragraph and heading sizes are now stated in terms of the zoom
+  factor (identical rendering at 100%), and lists, tables, quotes and code
+  follow by inheritance. The Markdown view and the diff panel were already
+  scaling; now the rich editor keeps up.
+
 - **First launch follows the system appearance.** A light-mode Mac used to get
   a dark editor until it found the toggle. The first explicit toggle still
   wins permanently.

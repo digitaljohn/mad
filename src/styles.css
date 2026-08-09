@@ -1369,6 +1369,39 @@ body.tauri.sidebar-hidden #topbar {
   font-size: calc(15.5px * var(--doc-scale));
   line-height: 1.6;
 }
+/* View ▸ Zoom, made real. Crepe's reset.css pins paragraphs and headings to
+   fixed pixel sizes, so scaling the container above changed nothing the eye
+   could see — the toast moved, the text didn't. Re-state Crepe's exact
+   numbers in terms of the zoom factor: at 100% these render identically,
+   and everything else (lists, tables, quotes, code) inherits and follows. */
+#editor .milkdown .ProseMirror p {
+  font-size: calc(16px * var(--doc-scale));
+  line-height: calc(24px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h1 {
+  font-size: calc(42px * var(--doc-scale));
+  line-height: calc(50px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h2 {
+  font-size: calc(36px * var(--doc-scale));
+  line-height: calc(44px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h3 {
+  font-size: calc(32px * var(--doc-scale));
+  line-height: calc(40px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h4 {
+  font-size: calc(28px * var(--doc-scale));
+  line-height: calc(36px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h5 {
+  font-size: calc(24px * var(--doc-scale));
+  line-height: calc(32px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h6 {
+  font-size: calc(18px * var(--doc-scale));
+  line-height: calc(28px * var(--doc-scale));
+}
 /* Trim Crepe's generous default block spacing. */
 #editor .milkdown .ProseMirror > * {
   margin-top: 0.55em;
