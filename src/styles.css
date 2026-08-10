@@ -1798,6 +1798,14 @@ milkdown-link-edit,
 #terminal-host .xterm-viewport {
   background-color: transparent !important;
   overflow-x: hidden;
+  /* xterm v6 draws its own themed scrollbar; the viewport's overflow only
+     exists to catch wheel input. WKWebView still gives it a native overlay
+     knob — unstylable, white on our dark panel, flashing in the corner on
+     every resize. Hide the native bar; the custom one is the indicator. */
+  scrollbar-width: none;
+}
+#terminal-host .xterm-viewport::-webkit-scrollbar {
+  display: none;
 }
 #btn-terminal.active {
   background: var(--active);
