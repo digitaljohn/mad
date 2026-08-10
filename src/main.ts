@@ -1580,6 +1580,9 @@ async function init() {
     const onUp = () => {
       termResizer.classList.remove("dragging");
       document.body.style.cursor = "";
+      // One settled refit: mid-drag fits lag the pointer by a frame, and
+      // the last one can be a cell short of the final height.
+      requestAnimationFrame(() => terminal?.resize());
       saveSession();
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);

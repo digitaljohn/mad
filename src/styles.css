@@ -1785,6 +1785,12 @@ milkdown-link-edit,
 #terminal-host .xterm {
   height: 100%;
 }
+/* The fitted grid grows in whole character cells, so a resize can leave a
+   remainder strip past the last row/column. xterm's stock stylesheet paints
+   the viewport black there — let the panel's own background show instead. */
+#terminal-host .xterm-viewport {
+  background-color: transparent !important;
+}
 #btn-terminal.active {
   background: var(--active);
   color: var(--clay);
