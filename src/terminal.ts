@@ -25,6 +25,12 @@ const DARK_THEME = {
   cursor: "#d97757",
   cursorAccent: "#1b1b1a",
   selectionBackground: "rgba(42, 120, 214, 0.35)",
+  // xterm v6's scrollbar is its own element, colored by the theme — left
+  // at its VS Code-gray default it reads as a white speck on our panel.
+  // Match the app's scrollbar thumbs instead.
+  scrollbarSliderBackground: "rgba(222, 220, 209, 0.15)",
+  scrollbarSliderHoverBackground: "rgba(222, 220, 209, 0.35)",
+  scrollbarSliderActiveBackground: "rgba(222, 220, 209, 0.45)",
 };
 const LIGHT_THEME = {
   background: "#f7f5ee",
@@ -32,6 +38,9 @@ const LIGHT_THEME = {
   cursor: "#c6613f",
   cursorAccent: "#f7f5ee",
   selectionBackground: "rgba(42, 120, 214, 0.22)",
+  scrollbarSliderBackground: "rgba(31, 30, 29, 0.2)",
+  scrollbarSliderHoverBackground: "rgba(31, 30, 29, 0.4)",
+  scrollbarSliderActiveBackground: "rgba(31, 30, 29, 0.5)",
 };
 
 function b64ToBytes(b64: string): Uint8Array {
