@@ -198,7 +198,22 @@ export function mockBackend(): Backend {
       const hits: SearchHit[] = [];
       for (const [path, content] of files) {
         if (!path.startsWith(pref) || !/\.(md|markdown)$/i.test(path)) continue;
+        // Fence tracking, matching the Rust backend's skip_fenced.
+        let fence: string | null = null;
         content.split("\n").forEach((text, i) => {
+          if (opts.skipFenced) {
+            const f = /^ {0,3}(`{3,}|~{3,})/.exec(text);
+            if (fence) {
+              if (f && f[1][0] === fence[0] && f[1].length >= fence.length) {
+                fence = null;
+              }
+              return;
+            }
+            if (f) {
+              fence = f[1];
+              return;
+            }
+          }
           const m = re.exec(text);
           if (m) {
             // Char (not code-unit) offsets, matching the Rust backend.

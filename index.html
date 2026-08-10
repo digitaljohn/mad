@@ -48,6 +48,15 @@
           <p>No folder open</p>
           <button id="btn-open-folder-side" class="btn-primary">Open Folder</button>
         </div>
+        <div id="outline-panel" class="hidden">
+          <div id="outline-head">
+            <span>Outline</span>
+            <button id="outline-close" class="icon-btn" title="Hide outline" aria-label="Hide outline">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+            </button>
+          </div>
+          <div id="outline-list" role="list" aria-label="Document headings"></div>
+        </div>
       </aside>
       <div id="resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
       <main id="content">
@@ -71,6 +80,7 @@
             <input id="find-input" type="text" placeholder="Find" spellcheck="false" aria-label="Find" />
             <button class="opt-btn" data-find-opt="case" title="Match case" aria-pressed="false">Aa</button>
             <button class="opt-btn" data-find-opt="word" title="Whole word" aria-pressed="false">ab</button>
+            <button class="opt-btn" data-find-opt="regex" title="Regular expression" aria-pressed="false">.*</button>
             <span id="find-count" aria-live="polite"></span>
             <div class="find-btns">
               <button id="find-prev" class="icon-btn" title="Previous (⇧⏎)" aria-label="Previous match"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11 10 8 6l-3 4"/></svg></button>

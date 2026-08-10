@@ -2,11 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import {
   MAX_SCALE,
   MIN_SCALE,
+  POSITIONS_CAP,
+  RECENT_CAP,
   SESSION_KEY,
+  capPositions,
   clampScale,
   clearSession,
   loadSession,
   parseSession,
+  pushRecent,
   saveSession,
   sessionKey,
   usableTabs,
@@ -50,6 +54,10 @@ describe("parseSession", () => {
       sidebarHidden: true,
       scale: 1.2,
       sidebarWidth: "300px",
+      recent: ["/w/a.md"],
+      positions: { "/w/a.md": { scroll: 120, sel: 44 } },
+      draft: "# not yet saved",
+      outlineHidden: false,
     };
     expect(parseSession(input)).toEqual(input);
   });
@@ -63,7 +71,52 @@ describe("parseSession", () => {
       sidebarHidden: false,
       scale: 1,
       sidebarWidth: null,
+      recent: [],
+      positions: {},
+      draft: null,
+      outlineHidden: true,
     });
+  });
+
+  it("validates positions field by field — a bad entry drops, not the map", () => {
+    const s = parseSession({
+      positions: {
+        "/w/a.md": { scroll: 10, sel: 5 },
+        "/w/b.md": { scroll: "high", sel: 5 },
+        "/w/c.md": { scroll: Infinity, sel: 0 },
+        "/w/d.md": null,
+        "/w/e.md": { scroll: 0 },
+      },
+    });
+    expect(s.positions).toEqual({ "/w/a.md": { scroll: 10, sel: 5 } });
+  });
+
+  it("treats a non-object positions blob as empty", () => {
+    for (const bad of [null, 7, "x", ["/w/a.md"]]) {
+      expect(parseSession({ positions: bad }).positions).toEqual({});
+    }
+  });
+
+  it("keeps only string entries of recent, capped", () => {
+    const s = parseSession({ recent: ["/w/a.md", 9, "/w/b.md"] });
+    expect(s.recent).toEqual(["/w/a.md", "/w/b.md"]);
+    const many = Array.from({ length: 99 }, (_, i) => `/w/${i}.md`);
+    expect(parseSession({ recent: many }).recent).toHaveLength(RECENT_CAP);
+  });
+
+  it("stores a draft only when there is text to come back to", () => {
+    expect(parseSession({ draft: "# hi" }).draft).toBe("# hi");
+    for (const bad of ["", 7, null, {}]) {
+      expect(parseSession({ draft: bad }).draft).toBe(null);
+    }
+  });
+
+  it("keeps the outline hidden unless it was explicitly shown", () => {
+    // The panel is opt-in: only a stored `false` (the user opened it) sticks.
+    expect(parseSession({ outlineHidden: false }).outlineHidden).toBe(false);
+    for (const bad of [true, "no", 0, undefined]) {
+      expect(parseSession({ outlineHidden: bad }).outlineHidden).toBe(true);
+    }
   });
 
   it("survives a stored blob of entirely the wrong shape", () => {
@@ -135,19 +188,64 @@ describe("saveSession", () => {
     expect(loadSession(store)).toEqual(session);
   });
 
-  it("swallows a quota failure — losing the session is not worth an error", () => {
+  it("reports a quota failure instead of throwing — the quit path warns on it", () => {
     const full = {
       setItem: () => {
         throw new Error("QuotaExceededError");
       },
     };
-    expect(() => saveSession(full, parseSession({}))).not.toThrow();
+    expect(saveSession(full, parseSession({}))).toBe(false);
+  });
+
+  it("reports success when the write lands", () => {
+    expect(saveSession(memoryStore(), parseSession({}))).toBe(true);
   });
 
   it("writes under the documented key", () => {
     const store = memoryStore();
     saveSession(store, parseSession({ root: "/w" }));
     expect(store.map.has(SESSION_KEY)).toBe(true);
+  });
+});
+
+describe("pushRecent", () => {
+  it("puts the newest first and deduplicates", () => {
+    expect(pushRecent(["/a", "/b"], "/c")).toEqual(["/c", "/a", "/b"]);
+    expect(pushRecent(["/a", "/b"], "/b")).toEqual(["/b", "/a"]);
+  });
+
+  it("caps the list", () => {
+    const list = Array.from({ length: RECENT_CAP }, (_, i) => `/f${i}`);
+    const next = pushRecent(list, "/new");
+    expect(next).toHaveLength(RECENT_CAP);
+    expect(next[0]).toBe("/new");
+    expect(next).not.toContain(`/f${RECENT_CAP - 1}`);
+  });
+
+  it("does not mutate its input", () => {
+    const list = ["/a"];
+    pushRecent(list, "/b");
+    expect(list).toEqual(["/a"]);
+  });
+});
+
+describe("capPositions", () => {
+  it("returns the same object under the cap", () => {
+    const p = { "/a": { scroll: 1, sel: 2 } };
+    expect(capPositions(p)).toBe(p);
+  });
+
+  it("keeps the newest entries when over the cap", () => {
+    const p: Record<string, { scroll: number; sel: number }> = {};
+    for (let i = 0; i < POSITIONS_CAP + 5; i++) p[`/f${i}`] = { scroll: i, sel: 0 };
+    const capped = capPositions(p);
+    expect(Object.keys(capped)).toHaveLength(POSITIONS_CAP);
+    // Insertion order is the age order here — the oldest five fall off.
+    expect(capped["/f0"]).toBeUndefined();
+    expect(capped[`/f${POSITIONS_CAP + 4}`]).toEqual({
+      scroll: POSITIONS_CAP + 4,
+      sel: 0,
+    });
   });
 });
 

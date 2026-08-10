@@ -1369,6 +1369,39 @@ body.tauri.sidebar-hidden #topbar {
   font-size: calc(15.5px * var(--doc-scale));
   line-height: 1.6;
 }
+/* View ▸ Zoom, made real. Crepe's reset.css pins paragraphs and headings to
+   fixed pixel sizes, so scaling the container above changed nothing the eye
+   could see — the toast moved, the text didn't. Re-state Crepe's exact
+   numbers in terms of the zoom factor: at 100% these render identically,
+   and everything else (lists, tables, quotes, code) inherits and follows. */
+#editor .milkdown .ProseMirror p {
+  font-size: calc(16px * var(--doc-scale));
+  line-height: calc(24px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h1 {
+  font-size: calc(42px * var(--doc-scale));
+  line-height: calc(50px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h2 {
+  font-size: calc(36px * var(--doc-scale));
+  line-height: calc(44px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h3 {
+  font-size: calc(32px * var(--doc-scale));
+  line-height: calc(40px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h4 {
+  font-size: calc(28px * var(--doc-scale));
+  line-height: calc(36px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h5 {
+  font-size: calc(24px * var(--doc-scale));
+  line-height: calc(32px * var(--doc-scale));
+}
+#editor .milkdown .ProseMirror h6 {
+  font-size: calc(18px * var(--doc-scale));
+  line-height: calc(28px * var(--doc-scale));
+}
 /* Trim Crepe's generous default block spacing. */
 #editor .milkdown .ProseMirror > * {
   margin-top: 0.55em;
@@ -1520,4 +1553,147 @@ milkdown-link-edit,
   font-family: var(--font-ui);
   font-size: 13px;
   color: var(--text-3);
+}
+
+/* -------------------------------------------------------- outline panel */
+
+#outline-panel {
+  flex-shrink: 0;
+  max-height: 40%;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+#outline-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 2px 16px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+#outline-list {
+  overflow-y: auto;
+  padding: 2px 8px 10px;
+}
+.outline-item {
+  padding: 3px 8px 3px calc(8px + 12px * var(--outline-indent, 0));
+  border-radius: 5px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.outline-item:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.outline-empty {
+  padding: 4px 8px 8px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------ front matter note */
+
+/* Shown over the rich editor while a document's YAML front matter is being
+   carried around it (the rich view can't display it without mangling it). */
+.fm-note {
+  max-width: 800px;
+  margin: 10px auto 0;
+  padding: 5px 24px;
+  font-size: 12px;
+  color: var(--text-3);
+  user-select: none;
+}
+
+/* While printing from source or split view, the raw text is mirrored into
+   this <pre> (a textarea cannot paginate). Never shown on screen. */
+.editor-print-source {
+  display: none;
+}
+
+/* ----------------------------------------------------------------- print */
+
+/* File ▸ Print…: only the document, on paper colors, however the app theme
+   is set. The system dialog's "Save as PDF" doubles as PDF export. */
+@media print {
+  :root {
+    --bg-page: #ffffff;
+    --bg-main: #ffffff;
+    --bg-panel: #ffffff;
+    --text: #1f1e1d;
+    --text-2: #3d3d3a;
+    --text-3: #73726c;
+    --border: rgba(0, 0, 0, 0.15);
+  }
+  body {
+    overflow: visible;
+    user-select: text;
+    background: #ffffff;
+  }
+  #app {
+    display: block;
+    height: auto;
+  }
+  #sidebar,
+  #resizer,
+  #topbar,
+  #statusbar,
+  #find-bar,
+  #diff-view,
+  .fm-note,
+  .palette,
+  .context-menu,
+  #toasts {
+    display: none !important;
+  }
+  #content {
+    display: block;
+    border-left: none;
+  }
+  #editor-host {
+    overflow: visible;
+  }
+  #editor .milkdown {
+    --crepe-color-background: transparent;
+    --crepe-color-on-background: #1f1e1d;
+    --crepe-color-surface: #ffffff;
+    --crepe-color-surface-low: #f0eee6;
+    --crepe-color-on-surface: #1f1e1d;
+    --crepe-color-on-surface-variant: #3d3d3a;
+    --crepe-color-outline: #73726c;
+    --crepe-color-inline-code: #b3502f;
+    --crepe-color-inline-area: #f0eee6;
+    --crepe-color-hover: transparent;
+    --crepe-color-selected: transparent;
+  }
+  /* Editing chrome prints as artifacts — drop it. */
+  #editor .milkdown .milkdown-block-handle,
+  .milkdown-slash-menu,
+  .milkdown-toolbar,
+  milkdown-toolbar {
+    display: none !important;
+  }
+  /* Source/split view: print the mirrored raw text, not the surfaces. */
+  .editor-print-source {
+    display: block;
+    max-width: 800px;
+    margin: 0 auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    color: #1f1e1d;
+  }
+  #editor:has(.editor-print-source) .editor-rich,
+  #editor:has(.editor-print-source) .editor-source {
+    display: none !important;
+  }
 }

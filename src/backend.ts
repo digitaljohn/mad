@@ -56,6 +56,9 @@ export interface SearchOptions {
   regex: boolean;
   caseSensitive: boolean;
   wholeWord: boolean;
+  /** Skip lines inside ``` fences — a `# comment` in a code block is not a
+      heading, and the workspace heading search must not list it as one. */
+  skipFenced?: boolean;
 }
 
 /** Thrown/returned by writeFile when the file changed underneath us. */
@@ -196,6 +199,7 @@ async function tauriBackend(): Promise<Backend> {
         regex: opts.regex,
         caseSensitive: opts.caseSensitive,
         wholeWord: opts.wholeWord,
+        skipFenced: opts.skipFenced ?? false,
       }),
     gitStatus: (root) => invoke<GitInfo | null>("git_status", { root }),
     gitDiff: (path) => invoke<string | null>("git_diff", { path }),

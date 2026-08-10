@@ -461,6 +461,9 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let open_folder = item("open_folder", "Open Folder…", Some("CmdOrCtrl+O"))?;
     let close_tab = gitem("close_tab", "Close Tab", Some("CmdOrCtrl+W"), Gate::Tab)?;
     let export_html = gitem("export_html", "Export as HTML…", None, Gate::Doc)?;
+    // No ⌘P here — this app spends it on Quick Open, like every editor its
+    // users already live in. Print stays a menu item.
+    let print = gitem("print", "Print…", None, Gate::Doc)?;
 
     let mut recent = SubmenuBuilder::new(app, "Open Recent");
     if recents.is_empty() {
@@ -491,6 +494,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
         .item(&save)
         .item(&save_as)
         .item(&export_html)
+        .item(&print)
         .separator()
         .item(&close_tab)
         .build()?;
@@ -563,6 +567,7 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
             "Toggle Sidebar",
             Some("CmdOrCtrl+\\"),
         )?)
+        .item(&gitem("toggle_outline", "Toggle Outline", None, Gate::Doc)?)
         .separator()
         .item(&gitem(
             "show_changes",
@@ -1442,7 +1447,25 @@ struct SearchResult {
     truncated: bool,
 }
 
+/// A line's code-fence opener: up to three spaces of indent, then a run of
+/// at least three backticks or tildes. Returns the fence character and run
+/// length so a closer can be required to match (CommonMark's rule).
+fn fence_run(line: &str) -> Option<(char, usize)> {
+    let s = line.trim_start_matches(' ');
+    if line.len() - s.len() > 3 {
+        return None;
+    }
+    let first = s.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let len = s.chars().take_while(|&c| c == first).count();
+    (len >= 3).then_some((first, len))
+}
+
 /// Full-text search across markdown files under `root`. Results are capped.
+/// `skip_fenced` drops lines inside ``` blocks — the workspace heading
+/// search must not offer a shell comment as a chapter.
 #[tauri::command]
 async fn search_files(
     root: String,
@@ -1450,8 +1473,10 @@ async fn search_files(
     regex: bool,
     case_sensitive: bool,
     whole_word: bool,
+    skip_fenced: Option<bool>,
 ) -> Result<SearchResult, String> {
     scope().check_root(&root)?;
+    let skip_fenced = skip_fenced.unwrap_or(false);
     if query.trim().is_empty() {
         return Ok(SearchResult {
             hits: vec![],
@@ -1469,6 +1494,10 @@ async fn search_files(
     let re = Arc::new(
         regex::RegexBuilder::new(&pattern)
             .case_insensitive(!case_sensitive)
+            // Matching is per line, so `^`/`$` must anchor lines — without
+            // this the whole-file early-out below discards every file whose
+            // *first byte* doesn't match a `^…` query, even when its lines do.
+            .multi_line(true)
             .size_limit(1 << 22)
             .build()
             .map_err(|e| e.to_string())?,
@@ -1514,7 +1543,22 @@ async fn search_files(
                 .into_owned();
             let path_s = path.to_string_lossy().into_owned();
             let mut local = Vec::new();
+            let mut fence: Option<(char, usize)> = None;
             for (i, line) in content.lines().enumerate() {
+                if skip_fenced {
+                    if let Some((open_char, open_len)) = fence {
+                        if let Some((c, n)) = fence_run(line) {
+                            if c == open_char && n >= open_len {
+                                fence = None;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(f) = fence_run(line) {
+                        fence = Some(f);
+                        continue;
+                    }
+                }
                 if let Some(m) = re.find(line) {
                     // Byte offsets are only meaningful to JS if the prefix is
                     // ASCII; send char offsets instead.
@@ -2285,13 +2329,15 @@ pub fn run() {
                 }
             };
             // Menu items that are just a named signal to the frontend.
-            const FORWARD: [(&str, &str); 20] = [
+            const FORWARD: [(&str, &str); 22] = [
                 ("open_folder", "menu-open-folder"),
                 ("new_file", "menu-new-file"),
                 ("new_folder", "menu-new-folder"),
                 ("save", "menu-save"),
                 ("save_as", "menu-save-as"),
                 ("export_html", "menu-export-html"),
+                ("print", "menu-print"),
+                ("toggle_outline", "menu-toggle-outline"),
                 ("close_tab", "menu-close-tab"),
                 ("find", "menu-find"),
                 ("find_replace", "menu-find-replace"),
@@ -2707,7 +2753,7 @@ mod tests {
     // ----------------------------------------------------------- searching
 
     fn search(t: &TempDir, q: &str, regex: bool, case: bool, word: bool) -> Vec<SearchHit> {
-        run(search_files(t.s(""), q.into(), regex, case, word))
+        run(search_files(t.s(""), q.into(), regex, case, word, None))
             .unwrap()
             .hits
     }
@@ -2758,7 +2804,51 @@ mod tests {
     #[test]
     fn a_bad_regex_is_an_error_not_a_panic() {
         let t = TempDir::new();
-        assert!(run(search_files(t.s(""), "([".into(), true, false, false)).is_err());
+        assert!(run(search_files(t.s(""), "([".into(), true, false, false, None)).is_err());
+    }
+
+    #[test]
+    fn skip_fenced_drops_code_lines_but_keeps_real_headings() {
+        let t = TempDir::new();
+        t.write(
+            "a.md",
+            "# Real\n```bash\n# a comment\n```\n~~~\n# tilde fenced\n~~~\n## Also real\n",
+        );
+        let with = run(search_files(
+            t.s(""),
+            "^#{1,6} ".into(),
+            true,
+            false,
+            false,
+            Some(true),
+        ))
+        .unwrap()
+        .hits;
+        let texts: Vec<&str> = with.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["# Real", "## Also real"]);
+        // Off by default: the plain search still sees inside fences.
+        let without = search(&t, "^#{1,6} ", true, false, false);
+        assert_eq!(without.len(), 4);
+    }
+
+    #[test]
+    fn skip_fenced_requires_a_matching_closer() {
+        let t = TempDir::new();
+        // A backtick fence is not closed by a tilde run, and a longer opener
+        // is not closed by a shorter run of the same character.
+        t.write("a.md", "````\n~~~\n# swallowed\n````\n# after\n");
+        let hits = run(search_files(
+            t.s(""),
+            "^# ".into(),
+            true,
+            false,
+            false,
+            Some(true),
+        ))
+        .unwrap()
+        .hits;
+        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["# after"]);
     }
 
     // ------------------------------------------------------------ watching
@@ -2964,7 +3054,15 @@ mod tests {
     fn an_empty_search_query_returns_nothing_without_walking() {
         let t = TempDir::new();
         t.write("a.md", "needle\n");
-        let res = run(search_files(t.s(""), "   ".into(), false, false, false)).unwrap();
+        let res = run(search_files(
+            t.s(""),
+            "   ".into(),
+            false,
+            false,
+            false,
+            None,
+        ))
+        .unwrap();
         assert!(res.hits.is_empty());
         assert!(!res.truncated);
     }

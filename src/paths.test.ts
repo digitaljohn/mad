@@ -9,6 +9,7 @@ import {
   escapeRe,
   IMG_RE,
   isUnder,
+  looksLikeUrl,
   MD_RE,
   normalize,
   normalizeTrailer,
@@ -141,6 +142,23 @@ describe("escaping", () => {
     // Quotes matter too: a filename containing " must survive a future move
     // of this output into an attribute context.
     expect(escapeHtml("<b>&\"'")).toBe("&lt;b&gt;&amp;&quot;&#39;");
+  });
+});
+
+describe("looksLikeUrl", () => {
+  it("accepts a single http(s) URL, whitespace-trimmed", () => {
+    expect(looksLikeUrl("https://example.com/a?b=1#c")).toBe(true);
+    expect(looksLikeUrl("  http://example.com  ")).toBe(true);
+    expect(looksLikeUrl("HTTPS://EXAMPLE.COM")).toBe(true);
+  });
+
+  it("rejects prose, other schemes and multi-token text", () => {
+    expect(looksLikeUrl("see https://example.com for details")).toBe(false);
+    expect(looksLikeUrl("example.com")).toBe(false);
+    expect(looksLikeUrl("mailto:a@b.c")).toBe(false);
+    expect(looksLikeUrl("file:///etc/passwd")).toBe(false);
+    expect(looksLikeUrl("https://")).toBe(false);
+    expect(looksLikeUrl("")).toBe(false);
   });
 });
 

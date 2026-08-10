@@ -1,9 +1,13 @@
 import { Crepe } from "@milkdown/crepe";
 import { editorViewCtx, remarkStringifyOptionsCtx } from "@milkdown/kit/core";
-import { callCommand, outline, replaceAll, $prose } from "@milkdown/kit/utils";
+import { callCommand, outline, replaceAll, $prose, $remark } from "@milkdown/kit/utils";
 import { DOMSerializer } from "@milkdown/kit/prose/model";
+import { TextSelection } from "@milkdown/kit/prose/state";
 import {
   bulletListSchema,
+  codeBlockSchema,
+  hardbreakSchema,
+  headingIdGenerator,
   remarkPreserveEmptyLinePlugin,
   toggleStrongCommand,
   toggleEmphasisCommand,
@@ -14,6 +18,8 @@ import {
   wrapInOrderedListCommand,
   wrapInHeadingCommand,
 } from "@milkdown/kit/preset/commonmark";
+import { remarkGFMPlugin } from "@milkdown/kit/preset/gfm";
+import { defaultHandlers } from "mdast-util-to-markdown";
 import {
   search,
   SearchQuery,
@@ -31,12 +37,15 @@ import {
   dirOf,
   escapeHtml,
   escapeRe,
+  looksLikeUrl,
   normalize,
   normalizeTrailer,
   countWords,
   readingMinutes,
   relativize,
 } from "./paths";
+import { joinFrontmatter, splitFrontmatter, restoreEscapes } from "./roundtrip";
+import { githubSlug } from "./outline";
 import { toast, toastError } from "./toast";
 
 /**
@@ -105,6 +114,7 @@ export interface FindOptions {
   replace?: string;
   caseSensitive?: boolean;
   wholeWord?: boolean;
+  regex?: boolean;
 }
 
 export interface DocStats {
@@ -149,6 +159,128 @@ const tightBulletLists = bulletListSchema.extendSchema((prev) => (ctx) => {
   };
 });
 
+/**
+ * Milkdown's code_block schema keeps only the fence's language and drops the
+ * rest of the info string — ```js title="x" {1,3} lost its attributes on the
+ * first save. Carry `meta` through the round trip untouched.
+ */
+const codeFenceMetaFix = codeBlockSchema.extendSchema((prev) => (ctx) => {
+  const base = prev(ctx);
+  return {
+    ...base,
+    attrs: { ...base.attrs, meta: { default: "", validate: "string" } },
+    parseMarkdown: {
+      match: base.parseMarkdown.match,
+      runner: (state, node, type) => {
+        const value = node.value as string | undefined;
+        state.openNode(type, {
+          language: (node.lang as string | null) ?? "",
+          meta: (node.meta as string | null) ?? "",
+        });
+        if (value) state.addText(value);
+        state.closeNode();
+      },
+    },
+    toMarkdown: {
+      match: base.toMarkdown.match,
+      runner: (state, node) => {
+        // Crepe's Latex feature stores $$ block math in this same schema,
+        // language "LaTeX", and serializes it back to a math node. This
+        // extension REPLACES Crepe's (last registration wins the node id),
+        // so that branch has to be reproduced here — without it, block math
+        // would land on disk as a ```LaTeX fence.
+        if (String(node.attrs.language ?? "").toLowerCase() === "latex") {
+          state.addNode("math", undefined, node.content.firstChild?.text || "");
+          return;
+        }
+        state.addNode("code", undefined, node.content.firstChild?.text || "", {
+          lang: node.attrs.language,
+          meta: node.attrs.meta || undefined,
+        });
+      },
+    },
+  };
+});
+
+/**
+ * remark models both hard-break spellings — trailing two spaces and a
+ * trailing backslash — as one `break` node, and always serializes the
+ * backslash form, rewriting every two-space break in the file. Tag each
+ * break with the marker it was written with (the parse transformer below
+ * reads the original bytes) and serialize it back the same way.
+ */
+const hardbreakMarkerFix = hardbreakSchema.extendSchema((prev) => (ctx) => {
+  const base = prev(ctx);
+  return {
+    ...base,
+    attrs: { ...base.attrs, marker: { default: "", validate: "string" } },
+    parseMarkdown: {
+      match: base.parseMarkdown.match,
+      runner: (state, node, type) => {
+        const data = node.data as { isInline?: boolean; marker?: string } | undefined;
+        state.addNode(type, {
+          isInline: Boolean(data?.isInline),
+          marker: String(data?.marker ?? ""),
+        });
+      },
+    },
+    toMarkdown: {
+      match: base.toMarkdown.match,
+      runner: (state, node) => {
+        if (node.attrs.isInline) {
+          state.addNode("text", undefined, "\n");
+        } else {
+          state.addNode(
+            "break",
+            undefined,
+            undefined,
+            node.attrs.marker ? { marker: node.attrs.marker } : undefined,
+          );
+        }
+      },
+    },
+  };
+});
+
+interface MdNode {
+  type?: string;
+  children?: MdNode[];
+  data?: { isInline?: boolean; marker?: string };
+  position?: { start?: { offset?: number }; end?: { offset?: number } };
+}
+
+/**
+ * Parse-side companion to `hardbreakMarkerFix`: remark keeps each node's
+ * source span, so the original bytes say which spelling the author used.
+ * Breaks without a position were synthesized (soft line breaks from
+ * `remarkLineBreak`) and are left alone.
+ */
+const breakMarkerRemark = $remark("madBreakMarker", () => () => {
+  return (tree: MdNode, file?: { value?: unknown }) => {
+    const source = typeof file?.value === "string" ? file.value : "";
+    if (!source) return;
+    const walk = (node: MdNode) => {
+      if (node.type === "break") {
+        const a = node.position?.start?.offset;
+        const b = node.position?.end?.offset;
+        if (typeof a === "number" && typeof b === "number" && b > a) {
+          const marker = source.slice(a, b).includes("\\") ? "backslash" : "spaces";
+          node.data = { ...node.data, marker };
+        }
+      }
+      for (const child of node.children ?? []) walk(child);
+    };
+    walk(tree);
+  };
+});
+
+/** Serialize a break with the marker it arrived with; default stays `\`. */
+const breakHandler: typeof defaultHandlers.break = (node, parent, state, info) => {
+  const out = defaultHandlers.break(node, parent, state, info);
+  const marker = (node as { marker?: string }).marker;
+  return out === "\\\n" && marker === "spaces" ? "  \n" : out;
+};
+
 /** Largest image we'll base64 through the IPC bridge. */
 const MAX_UPLOAD_BYTES = 32 * 1024 * 1024;
 
@@ -157,6 +289,14 @@ export class MarkdownEditor {
   private host: HTMLElement;
   private richEl: HTMLElement;
   private sourceEl: HTMLTextAreaElement;
+  /** A small banner shown while YAML front matter is being carried around
+      the rich editor (which cannot display it without mangling it). */
+  private fmNote: HTMLElement;
+  /** Leading YAML front matter of the open document, byte-exact. The rich
+      editor never sees it — remark would parse `---` as a thematic break and
+      the metadata as a heading — so it is split off on the way in and glued
+      back on in `content()`. Source mode edits the full text directly. */
+  private fm = "";
   private _mode: EditorMode = "rich";
   private split = false;
   private previewTimer: ReturnType<typeof setTimeout> | undefined;
@@ -196,8 +336,12 @@ export class MarkdownEditor {
     this.sourceEl.setAttribute("autocomplete", "off");
     this.sourceEl.setAttribute("autocapitalize", "off");
     this.sourceEl.setAttribute("aria-label", "Markdown source");
+    this.fmNote = document.createElement("div");
+    this.fmNote.className = "fm-note hidden";
+    this.fmNote.textContent =
+      "Front matter preserved — view and edit it in the Markdown source.";
     this.host = host;
-    host.append(this.richEl, this.sourceEl);
+    host.append(this.fmNote, this.richEl, this.sourceEl);
 
     this.sourceEl.addEventListener("input", () => {
       if (this._mode === "source") this.scheduleSave();
@@ -209,6 +353,22 @@ export class MarkdownEditor {
     }
     // Split view: keep the rendered pane roughly aligned with the source.
     this.sourceEl.addEventListener("scroll", () => this.syncScroll());
+
+    // A textarea never paginates, so printing from source or split view
+    // would come out blank. Mirror the raw text into a printable <pre> for
+    // the duration of the print, and let the print CSS swap the surfaces.
+    let printMirror: HTMLPreElement | null = null;
+    window.addEventListener("beforeprint", () => {
+      if (this._mode !== "source" && !this.split) return;
+      printMirror = document.createElement("pre");
+      printMirror.className = "editor-print-source";
+      printMirror.textContent = this.sourceEl.value;
+      host.appendChild(printMirror);
+    });
+    window.addEventListener("afterprint", () => {
+      printMirror?.remove();
+      printMirror = null;
+    });
 
     // Accept image drags from the sidebar tree; capture phase so
     // ProseMirror's own drop handling never sees them.
@@ -263,7 +423,16 @@ export class MarkdownEditor {
             if (f) imgs.push(f);
           }
         }
-        if (!imgs.length) return;
+        if (!imgs.length) {
+          // Pasting a URL over selected text links the selection instead of
+          // replacing it — the way every serious editor treats that gesture.
+          const text = e.clipboardData?.getData("text/plain") ?? "";
+          if (looksLikeUrl(text) && this.linkSelection(text.trim())) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          return;
+        }
         if (!this.currentPath) {
           // Images live beside the note, so there has to be a note first.
           e.preventDefault();
@@ -421,13 +590,24 @@ export class MarkdownEditor {
     toast("Reloaded — the file changed on disk");
   }
 
-  /** Push `markdown` into whichever surfaces are live. */
+  /** Push `markdown` (full file text) into whichever surfaces are live. */
   private applyContent(markdown: string) {
     this.statsCache = null; // next getStats serializes once, then re-caches
+    const { frontmatter, body } = splitFrontmatter(markdown);
+    this.fm = frontmatter;
     if (this._mode === "rich" || this.split) {
-      this.crepe?.editor.action(replaceAll(markdown, true));
+      this.crepe?.editor.action(replaceAll(body, true));
     }
     if (this._mode === "source") this.sourceEl.value = markdown;
+    this.syncFmNote();
+  }
+
+  /** The front-matter banner belongs only over a rich surface hiding some. */
+  private syncFmNote() {
+    this.fmNote.classList.toggle(
+      "hidden",
+      !this.fm || this._mode !== "rich" || this.split,
+    );
   }
 
   // ------------------------------------------------------ outline & commands
@@ -489,6 +669,100 @@ export class MarkdownEditor {
   /** Link the selection (empty href → Crepe's link tooltip lets you fill it). */
   toggleLink(href = "") {
     this.run(toggleLinkCommand.key, { href });
+  }
+
+  /** Apply `href` to the current selection. False when nothing is selected
+      (the caller should let the paste proceed as an ordinary insert). */
+  private linkSelection(href: string): boolean {
+    if (this._mode === "source") {
+      const ta = this.sourceEl;
+      const a = ta.selectionStart ?? 0;
+      const b = ta.selectionEnd ?? 0;
+      if (a === b) return false;
+      const label = ta.value.slice(a, b);
+      const md = `[${label}](${href})`;
+      ta.value = ta.value.slice(0, a) + md + ta.value.slice(b);
+      ta.selectionStart = ta.selectionEnd = a + md.length;
+      this.scheduleSave();
+      if (this.split) this.schedulePreview();
+      this.onChanged?.();
+      return true;
+    }
+    const view = this.view();
+    if (!view) return false;
+    const { from, to, empty } = view.state.selection;
+    const link = view.state.schema.marks.link;
+    if (empty || !link) return false;
+    // A selection inside a code fence (marks: "") or a node selection on an
+    // image block can't carry a link mark — claiming the gesture there would
+    // swallow the paste. Let it proceed as an ordinary insert instead.
+    let linkable = false;
+    view.state.doc.nodesBetween(from, to, (node, _pos, parent) => {
+      if (node.isInline && parent?.type.allowsMarkType(link)) linkable = true;
+    });
+    if (!linkable) return false;
+    view.dispatch(view.state.tr.addMark(from, to, link.create({ href })));
+    view.focus();
+    return true;
+  }
+
+  /** Insert a link to `href`, labelled `text`, at the caret — or turn the
+      current selection into that link. Used by “Insert Link to File…”. */
+  insertLinkTo(href: string, text: string) {
+    if (this._mode === "source") {
+      this.spliceSource(`[${text}](${href})`);
+      this.sourceEl.focus();
+      return;
+    }
+    if (this.linkSelection(href)) return;
+    const view = this.view();
+    if (!view) return;
+    const link = view.state.schema.marks.link;
+    if (!link) return;
+    const from = view.state.selection.from;
+    const tr = view.state.tr.insertText(text, from);
+    tr.addMark(from, from + text.length, link.create({ href }));
+    view.dispatch(tr.scrollIntoView());
+    view.focus();
+  }
+
+  // --------------------------------------------------------- view position
+
+  /** Scroll offset + caret of the active surface, for session restore. */
+  getViewState(): { scroll: number; sel: number } | null {
+    if (this._mode === "source") {
+      return {
+        scroll: this.sourceEl.scrollTop,
+        sel: this.sourceEl.selectionStart ?? 0,
+      };
+    }
+    const view = this.view();
+    if (!view) return null;
+    return { scroll: this.richEl.scrollTop, sel: view.state.selection.anchor };
+  }
+
+  /** Best-effort restore of `getViewState` output onto the active surface. */
+  setViewState(pos: { scroll: number; sel: number }) {
+    if (this._mode === "source") {
+      const at = Math.max(0, Math.min(pos.sel, this.sourceEl.value.length));
+      this.sourceEl.setSelectionRange(at, at);
+      this.sourceEl.scrollTop = pos.scroll;
+      return;
+    }
+    const view = this.view();
+    if (!view) return;
+    try {
+      const at = Math.max(0, Math.min(pos.sel, view.state.doc.content.size));
+      view.dispatch(
+        view.state.tr.setSelection(TextSelection.near(view.state.doc.resolve(at))),
+      );
+    } catch {
+      /* the document changed shape — the scroll restore below still helps */
+    }
+    // After ProseMirror has painted, or the scroll write is clobbered.
+    requestAnimationFrame(() => {
+      this.richEl.scrollTop = pos.scroll;
+    });
   }
   toggleQuote() {
     this.run(wrapInBlockquoteCommand.key);
@@ -581,17 +855,21 @@ export class MarkdownEditor {
     return this.enqueue(() => this.doSave());
   }
 
-  /** The current document content, from whichever surface is active. */
+  /** The current document content, from whichever surface is active. In rich
+      mode that is the carried front matter plus the serialized document. */
   private content(): string {
     if (this._mode === "source") return this.sourceEl.value;
-    return this.richMarkdown();
+    return joinFrontmatter(this.fm, this.richMarkdown());
   }
 
   /** Serialized rich document, normalized to exactly one trailing newline —
       ProseMirror keeps a trailing empty paragraph that would otherwise add a
-      blank line to the file on every first save. */
+      blank line to the file on every first save — and with the escapes
+      remark adds to wikilinks, alerts and `[toc]` undone. */
   private richMarkdown(): string {
-    return normalizeTrailer(this.crepe ? this.crepe.getMarkdown() : "");
+    return restoreEscapes(
+      normalizeTrailer(this.crepe ? this.crepe.getMarkdown() : ""),
+    );
   }
 
   toggleMode() {
@@ -615,7 +893,7 @@ export class MarkdownEditor {
     if (on) {
       this.modeBeforeSplit = this._mode;
       if (this._mode === "rich") {
-        this.sourceEl.value = this.richMarkdown();
+        this.sourceEl.value = this.content();
         this._mode = "source";
         this.onMode?.("source");
       }
@@ -633,6 +911,7 @@ export class MarkdownEditor {
         this.sourceEl.classList.remove("hidden");
       }
     }
+    this.syncFmNote();
   }
 
   /** Mirror the source pane's scroll position onto the rendered preview. */
@@ -658,28 +937,35 @@ export class MarkdownEditor {
 
   private updatePreview() {
     if (!this.split || !this.crepe) return;
-    this.crepe.editor.action(replaceAll(this.sourceEl.value, true));
+    // The preview renders the document, not its metadata block.
+    const { body } = splitFrontmatter(this.sourceEl.value);
+    this.crepe.editor.action(replaceAll(body, true));
   }
 
   setMode(mode: EditorMode) {
     if (mode === this._mode || this.split) return;
     if (mode === "source") {
-      // rich → source: surface the serialized markdown for raw editing.
-      this.sourceEl.value = this.richMarkdown();
+      // rich → source: surface the full text — carried front matter and all —
+      // for raw editing.
+      this.sourceEl.value = this.content();
       this._mode = "source";
       this.richEl.classList.add("hidden");
       this.sourceEl.classList.remove("hidden");
       this.sourceEl.focus();
     } else {
-      // source → rich: parse the raw text back into the WYSIWYG document.
+      // source → rich: parse the raw text back into the WYSIWYG document,
+      // splitting off whatever front matter it now carries.
       const text = this.sourceEl.value;
       this._mode = "rich";
-      this.crepe?.editor.action(replaceAll(text, true));
+      const { frontmatter, body } = splitFrontmatter(text);
+      this.fm = frontmatter;
+      this.crepe?.editor.action(replaceAll(body, true));
       this.sourceEl.classList.add("hidden");
       this.richEl.classList.remove("hidden");
       // Edits made as raw text must still persist.
       if (text !== this.lastSaved) this.scheduleSave();
     }
+    this.syncFmNote();
     this.onMode?.(this._mode);
     this.onChanged?.();
   }
@@ -694,14 +980,17 @@ export class MarkdownEditor {
     this.stamp = stamp;
     this.warnedStamp = null;
     this.statsCache = null;
+    const { frontmatter, body } = splitFrontmatter(markdown);
+    this.fm = frontmatter;
     if (!this.crepe) {
-      await this.mount(this._mode === "rich" || this.split ? markdown : "");
+      await this.mount(this._mode === "rich" || this.split ? body : "");
     } else if (this._mode === "rich" || this.split) {
       // flush=true resets undo history — switching files shouldn't be undoable.
-      this.crepe.editor.action(replaceAll(markdown, true));
+      this.crepe.editor.action(replaceAll(body, true));
     }
     if (this._mode === "source") this.sourceEl.value = markdown;
     if (this.split) this.updatePreview();
+    this.syncFmNote();
     // Baseline the *serialized* doc, not the raw file text: Crepe may
     // normalize markdown (list bullets, spacing), and normalization alone
     // must never count as an edit or rewrite an untouched file.
@@ -718,12 +1007,15 @@ export class MarkdownEditor {
     this.currentPath = null;
     this.stamp = "";
     this.statsCache = null;
+    const { frontmatter, body } = splitFrontmatter(content);
+    this.fm = frontmatter;
     if (!this.crepe) {
-      await this.mount(this._mode === "rich" || this.split ? content : "");
+      await this.mount(this._mode === "rich" || this.split ? body : "");
     } else if (this._mode === "rich" || this.split) {
-      this.crepe.editor.action(replaceAll(content, true));
+      this.crepe.editor.action(replaceAll(body, true));
     }
     if (this._mode === "source") this.sourceEl.value = content;
+    this.syncFmNote();
     this.lastSaved = this.content();
     this.dirty = false;
     this.onState("unsaved");
@@ -935,9 +1227,6 @@ export class MarkdownEditor {
     const crepe = new Crepe({
       root: this.richEl,
       defaultValue: markdown,
-      features: {
-        [Crepe.Feature.Latex]: false,
-      },
       featureConfigs: {
         [Crepe.Feature.ImageBlock]: {
           onUpload: this.upload,
@@ -961,9 +1250,14 @@ export class MarkdownEditor {
       api.markdownUpdated((_ctx, markdown, prevMarkdown) => {
         if (this._mode !== "rich") return;
         this.statsCache = markdown;
-        // Compare the same normalized form we save, or merely *opening* a file
+        // Compare the same form we save — carried front matter, trailing
+        // newline and escape fixes included — or merely *opening* a file
         // would look like an edit.
-        if (markdown === prevMarkdown || normalizeTrailer(markdown) === this.lastSaved)
+        if (
+          markdown === prevMarkdown ||
+          joinFrontmatter(this.fm, restoreEscapes(normalizeTrailer(markdown))) ===
+            this.lastSaved
+        )
           return;
         this.scheduleSave();
         this.onChanged?.();
@@ -971,13 +1265,21 @@ export class MarkdownEditor {
     });
 
     // Serialize the way people actually write markdown, so simply opening and
-    // saving a note doesn't rewrite its bullets and rules.
+    // saving a note doesn't rewrite its bullets, rules or hard breaks.
     crepe.editor.config((ctx) => {
       ctx.update(remarkStringifyOptionsCtx, (prev) => ({
         ...prev,
         bullet: "-" as const,
         rule: "-" as const,
+        handlers: { ...prev.handlers, break: breakHandler },
       }));
+      // `~sub~` is subscript in half the markdown out there; parsing it as
+      // strikethrough rewrote H~2~O to H~~2~~O on save. GitHub requires the
+      // double tilde anyway.
+      ctx.set(remarkGFMPlugin.options.key, { singleTilde: false });
+      // GitHub's slug algorithm, so anchors written for github.com resolve
+      // here and headings link the same way in both places.
+      ctx.set(headingIdGenerator.key, (node) => githubSlug(node.textContent));
     });
 
     // In-editor find/replace via prosemirror-search (registered before create).
@@ -985,6 +1287,9 @@ export class MarkdownEditor {
     // Registered after Crepe's own features so these schemas win the node ids.
     crepe.editor.use(imageAltFix);
     crepe.editor.use(tightBulletLists);
+    crepe.editor.use(codeFenceMetaFix);
+    crepe.editor.use(hardbreakMarkerFix);
+    crepe.editor.use(breakMarkerRemark);
 
     // Crepe preserves blank lines by serializing them as literal `<br />`
     // HTML. Drop that plugin so documents save as standard markdown —
@@ -1048,7 +1353,9 @@ export class MarkdownEditor {
     if (!this.crepe) return "";
     // In plain source mode the rich document may be stale — refresh it first.
     if (this._mode === "source" && !this.split) {
-      this.crepe.editor.action(replaceAll(this.sourceEl.value, true));
+      this.crepe.editor.action(
+        replaceAll(splitFrontmatter(this.sourceEl.value).body, true),
+      );
     }
     const body = this.crepe.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx);
@@ -1094,6 +1401,7 @@ export class MarkdownEditor {
       search: term,
       caseSensitive: opts.caseSensitive ?? false,
       wholeWord: opts.wholeWord ?? false,
+      regexp: opts.regex ?? false,
       replace: opts.replace ?? "",
     });
     view.dispatch(setSearchState(view.state.tr, query));
@@ -1166,15 +1474,16 @@ export class MarkdownEditor {
   private srcReplace = "";
   private srcCaseSensitive = false;
   private srcWholeWord = false;
+  private srcIsRegex = false;
 
   private srcRegex(): RegExp | null {
     if (!this.srcQuery) return null;
-    let source = escapeRe(this.srcQuery);
+    let source = this.srcIsRegex ? this.srcQuery : escapeRe(this.srcQuery);
     if (this.srcWholeWord) source = `\\b(?:${source})\\b`;
     try {
       return new RegExp(source, this.srcCaseSensitive ? "g" : "gi");
     } catch {
-      return null;
+      return null; // invalid pattern reads as “no matches”, like rich mode
     }
   }
 
@@ -1183,6 +1492,7 @@ export class MarkdownEditor {
     this.srcReplace = opts.replace ?? "";
     this.srcCaseSensitive = opts.caseSensitive ?? false;
     this.srcWholeWord = opts.wholeWord ?? false;
+    this.srcIsRegex = opts.regex ?? false;
     this.srcMatches = [];
     this.srcIndex = -1;
     const re = this.srcRegex();
@@ -1216,7 +1526,13 @@ export class MarkdownEditor {
       return { count: this.srcMatches.length, index: this.srcIndex + 1 };
     const [a, b] = this.srcMatches[this.srcIndex];
     const ta = this.sourceEl;
-    ta.value = ta.value.slice(0, a) + this.srcReplace + ta.value.slice(b);
+    // Replace within the matched slice via the same regex, so `$1` group
+    // references expand exactly like they do in Replace All.
+    const re = this.srcRegex();
+    const insert = re
+      ? ta.value.slice(a, b).replace(re, this.srcReplace)
+      : this.srcReplace;
+    ta.value = ta.value.slice(0, a) + insert + ta.value.slice(b);
     this.scheduleSave();
     if (this.split) this.schedulePreview();
     this.onChanged?.();
@@ -1224,6 +1540,7 @@ export class MarkdownEditor {
       replace: this.srcReplace,
       caseSensitive: this.srcCaseSensitive,
       wholeWord: this.srcWholeWord,
+      regex: this.srcIsRegex,
     });
   }
 

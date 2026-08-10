@@ -14,24 +14,30 @@ import {
   IMG_RE,
   MD_RE,
   baseOf,
+  dirOf,
   displayName,
   escapeHtml,
   isUnder,
   parentOf,
+  relativize,
   remapPath,
   resolveLink,
 } from "./paths";
 import {
+  capPositions,
   clampScale,
   clearSession,
   loadSession,
+  pushRecent,
   saveSession as persistSession,
   sessionKey,
   usableTabs,
   type Session,
+  type ViewPosition,
 } from "./session";
 import { MarkdownEditor, type SaveState, type EditorMode } from "./editor";
 import { resolveKey } from "./keys";
+import { githubSlug, parseHeadingLine, renderOutline, sourceOutline } from "./outline";
 import { CommandPalette, ICON_COMMAND, ICON_HEADING } from "./palette";
 import { toast, toastError } from "./toast";
 import { checkForUpdates } from "./updater";
@@ -91,19 +97,42 @@ async function init() {
   /** git status per absolute path, mirrored onto tabs as well as the tree. */
   let gitMap = new Map<string, GitStatus>();
   let docScale = clampScale(saved.scale);
+  /** Recently active files, most recent first — Quick Open shows these on top. */
+  let recentFiles = saved.recent;
+  /** Last known scroll/caret per file, in-session and across launches. */
+  const viewPositions = new Map<string, ViewPosition>(Object.entries(saved.positions));
+  /** Re-insert so capPositions trims least-recently-used entries, not the
+      file that happened to be opened first. */
+  const rememberPosition = (path: string, pos: ViewPosition) => {
+    viewPositions.delete(path);
+    viewPositions.set(path, pos);
+  };
+  let outlineHidden = saved.outlineHidden;
 
   // ------------------------------------------------------------- session
 
   let sessionTimer: ReturnType<typeof setTimeout> | undefined;
-  const buildSession = (): Session => ({
-    root: rootPath,
-    tabs: tabs.filter((t) => !t.draft).map((t) => t.path),
-    active: activePath === DRAFT ? null : activePath,
-    expanded: tree.expandedDirs,
-    sidebarHidden: document.body.classList.contains("sidebar-hidden"),
-    scale: docScale,
-    sidebarWidth: sidebar.style.width || null,
-  });
+  const buildSession = (): Session => {
+    // The live document's position is captured on switch/close; grab the
+    // current one here so a quit mid-scroll still lands where it left off.
+    if (activePath && !activeTab()?.draft && editor.path === activePath) {
+      const pos = editor.getViewState();
+      if (pos) rememberPosition(activePath, pos);
+    }
+    return {
+      root: rootPath,
+      tabs: tabs.filter((t) => !t.draft).map((t) => t.path),
+      active: activePath === DRAFT ? null : activePath,
+      expanded: tree.expandedDirs,
+      sidebarHidden: document.body.classList.contains("sidebar-hidden"),
+      scale: docScale,
+      sidebarWidth: sidebar.style.width || null,
+      recent: recentFiles,
+      positions: capPositions(Object.fromEntries(viewPositions)),
+      draft: hasUnsavedDraft() ? draftContent() : null,
+      outlineHidden,
+    };
+  };
   const saveSession = () => {
     clearTimeout(sessionTimer);
     sessionTimer = setTimeout(
@@ -134,6 +163,7 @@ async function init() {
       btn.classList.toggle("active", btn.dataset.mode === mode);
     }
     updateStatus();
+    scheduleOutline();
   };
 
   const editor = new MarkdownEditor(
@@ -142,7 +172,13 @@ async function init() {
     setSaveState,
     setModeUI,
     (dir) => void tree.refreshDir(dir), // show pasted/dropped images in the tree
-    () => updateStatus(),
+    () => {
+      updateStatus();
+      scheduleOutline();
+      // The draft lives nowhere but memory — mirror it into the session so a
+      // crash or quit can't destroy it.
+      if (activePath === DRAFT) saveSession();
+    },
   );
 
   const activeTab = () => tabs.find((t) => t.path === activePath) ?? null;
@@ -154,10 +190,16 @@ async function init() {
         ? baseOf(tab.path)
         : displayName(tab.path);
 
+  /** The draft's live text. `activePath === DRAFT` alone is not proof the
+      editor holds the draft — a superseded activation can leave them pointing
+      at different documents — so `editor.isDraft` must agree before trusting
+      the editor's buffer over the stashed one. */
+  const draftContent = () =>
+    activePath === DRAFT && editor.isDraft ? editor.getContent() : draftBuffer;
+
   const hasUnsavedDraft = () => {
     if (!tabs.some((t) => t.draft)) return false;
-    const content = activePath === DRAFT ? editor.getContent() : draftBuffer;
-    return content.trim().length > 0;
+    return draftContent().trim().length > 0;
   };
 
   // Keep the state-gated native menu items truthful: doc-scoped items need an
@@ -436,6 +478,13 @@ async function init() {
       return true;
     }
 
+    // Remember where the outgoing document was scrolled to, so coming back
+    // to its tab doesn't land at the top.
+    if (activePath && activePath !== DRAFT && editor.path === activePath) {
+      const pos = editor.getViewState();
+      if (pos) rememberPosition(activePath, pos);
+    }
+
     // Preserve the unsaved draft's content before we leave it.
     if (activePath === DRAFT && editor.isDraft) draftBuffer = editor.getContent();
 
@@ -478,11 +527,13 @@ async function init() {
       };
       imageViewerImg.src = url;
       activePath = path;
+      recentFiles = pushRecent(recentFiles, path);
       showSurface("image");
       tree.select(path);
       renderTabs();
       updateMenuState();
       updateStatus();
+      refreshOutline();
       saveSession();
       return true;
     }
@@ -499,11 +550,15 @@ async function init() {
     }
     if (seq !== activateSeq) return false; // superseded while loading
     activePath = path;
+    const pos = viewPositions.get(path);
+    if (pos) editor.setViewState(pos);
+    recentFiles = pushRecent(recentFiles, path);
     showSurface("editor");
     tree.select(path);
     renderTabs();
     updateMenuState();
     updateStatus();
+    refreshOutline();
     saveSession();
     return true;
   };
@@ -524,6 +579,7 @@ async function init() {
     tree.select(null);
     updateMenuState();
     updateStatus();
+    refreshOutline();
     saveSession();
   };
 
@@ -538,7 +594,7 @@ async function init() {
     if (idx < 0) return;
     const tab = tabs[idx];
     if (tab.draft) {
-      const content = activePath === DRAFT ? editor.getContent() : draftBuffer;
+      const content = draftContent();
       if (
         content.trim() &&
         !(await backend.confirm(
@@ -549,7 +605,7 @@ async function init() {
         return;
       }
       draftBuffer = "";
-      if (activePath === DRAFT) editor.detach();
+      if (activePath === DRAFT && editor.isDraft) editor.detach();
     }
     if (activePath !== path) {
       tabs.splice(idx, 1);
@@ -1095,12 +1151,21 @@ async function init() {
   };
   const applyTheme = (light: boolean) => {
     document.documentElement.classList.toggle("light", light);
-    localStorage.setItem(THEME_KEY, light ? "light" : "dark");
     editor.setMermaidTheme(light);
   };
-  applyTheme(localStorage.getItem(THEME_KEY) === "light");
+  // Until the user picks a side, the app follows the system — a light-mode
+  // Mac shouldn't get a dark editor on first launch. The first explicit
+  // toggle writes the preference and ends the following.
+  const systemLight = window.matchMedia?.("(prefers-color-scheme: light)");
+  const storedTheme = localStorage.getItem(THEME_KEY);
+  applyTheme(storedTheme ? storedTheme === "light" : !!systemLight?.matches);
+  systemLight?.addEventListener?.("change", (e) => {
+    if (!localStorage.getItem(THEME_KEY)) applyTheme(e.matches);
+  });
   const toggleTheme = () => {
-    applyTheme(!document.documentElement.classList.contains("light"));
+    const light = !document.documentElement.classList.contains("light");
+    localStorage.setItem(THEME_KEY, light ? "light" : "dark");
+    applyTheme(light);
     // Theme is an app-wide preference, not a per-window one — a light window
     // beside a dark one is nobody's intention.
     void broadcastPrefs();
@@ -1197,11 +1262,13 @@ async function init() {
     searchInput.focus();
     searchInput.select();
     if (searchInput.value) void runSearch();
+    refreshOutline(); // the search panel borrows the outline's space
   };
   const closeSearch = () => {
     searchPanel.classList.add("hidden");
     if (rootPath) treeEl.classList.remove("hidden");
     else sidebarEmpty.classList.remove("hidden");
+    refreshOutline();
   };
   $("btn-search").addEventListener("click", () =>
     searchPanel.classList.contains("hidden") ? openSearch() : closeSearch(),
@@ -1309,6 +1376,46 @@ async function init() {
     }
   });
 
+  // ------------------------------------------------------- outline panel
+  const outlinePanel = $("outline-panel");
+  const outlineList = $("outline-list");
+  let outlineTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Headings of the active document, from whichever surface is current.
+      The rich editor knows its ids; raw text is scanned with the same slug
+      rules, so clicking a row lands on the same heading either way. */
+  const outlineItems = () => {
+    if (!isMd()) return [];
+    if (editor.mode === "rich" && !editor.isSplit) return editor.getOutline();
+    return sourceOutline(editor.getContent());
+  };
+
+  const refreshOutline = () => {
+    clearTimeout(outlineTimer);
+    const hide = outlineHidden || !isMd() || !searchPanel.classList.contains("hidden");
+    outlinePanel.classList.toggle("hidden", hide);
+    if (hide) return;
+    renderOutline(outlineList, outlineItems(), (item) => {
+      if (item.line !== undefined && (editor.mode === "source" || editor.isSplit)) {
+        editor.revealSourceLine(item.line);
+      } else {
+        showSurface("editor");
+        editor.scrollToHeading(item.id);
+      }
+    });
+  };
+  /** Coalesce per-keystroke refreshes — rebuilding a list per key is noise. */
+  const scheduleOutline = () => {
+    clearTimeout(outlineTimer);
+    outlineTimer = setTimeout(refreshOutline, 300);
+  };
+  const toggleOutline = () => {
+    outlineHidden = !outlineHidden;
+    refreshOutline();
+    saveSession();
+  };
+  $("outline-close").addEventListener("click", toggleOutline);
+
   // -------------------------------------------------------- command palette
   interface Command {
     title: string;
@@ -1324,6 +1431,7 @@ async function init() {
     { title: "Save", hint: "⌘S", run: () => void save(), when: isMd },
     { title: "Save As…", hint: "⌘⇧S", run: () => void saveAs(), when: isMd },
     { title: "Export as HTML…", run: () => void exportHtml(), when: isMd },
+    { title: "Print…", run: () => window.print(), when: isMd },
     {
       title: "Reveal in Finder",
       run: () => {
@@ -1354,6 +1462,18 @@ async function init() {
       run: () => void palette.show("#"),
       when: isMd,
     },
+    {
+      title: "Go to Heading in Workspace…",
+      hint: "##",
+      run: () => void palette.show("##"),
+      when: () => !!rootPath,
+    },
+    {
+      title: "Insert Link to File…",
+      run: () => void insertLinkToFile(),
+      when: () => isMd() && !editor.isDraft && !!rootPath,
+    },
+    { title: "Toggle Outline", run: () => toggleOutline(), when: isMd },
     {
       title: "Toggle Markdown Source",
       hint: "⌘⇧M",
@@ -1386,6 +1506,12 @@ async function init() {
     files: async () => {
       if (!rootPath) return [];
       const all = await backend.listAll(rootPath);
+      // Recently used files first — with no query typed, the file you want
+      // is almost always one you had open a moment ago. Fuzzy ranking takes
+      // over as soon as there is a needle.
+      const recency = new Map(recentFiles.map((p, i) => [p, i]));
+      const rank = (p: string) => recency.get(p) ?? recency.size + 1;
+      all.sort((a, b) => rank(a.path) - rank(b.path) || a.rel.localeCompare(b.rel));
       return all.map((f) => ({
         title: baseOf(f.rel).replace(MD_RE, ""),
         // Show the containing folder, not the whole path — repeating the
@@ -1415,7 +1541,61 @@ async function init() {
           editor.scrollToHeading(h.id);
         },
       })),
+    headings: async () => {
+      if (!rootPath) return [];
+      // The Rust search already walks every markdown file in parallel;
+      // heading lines are just one more query.
+      const res = await backend.searchFiles(rootPath, "^#{1,6} ", {
+        regex: true,
+        caseSensitive: false,
+        wholeWord: false,
+        skipFenced: true, // a `# comment` in a code block is not a heading
+      });
+      const items = [];
+      for (const h of res.hits) {
+        const parsed = parseHeadingLine(h.text);
+        if (!parsed) continue;
+        items.push({
+          title: parsed.text,
+          subtitle: `H${parsed.level} · ${h.rel}`,
+          search: `${parsed.text} ${h.rel}`,
+          icon: ICON_HEADING,
+          run: async () => {
+            if (!(await openFile(h.path))) return;
+            if (editor.mode === "rich" && !editor.isSplit) {
+              editor.scrollToHeading(githubSlug(parsed.text));
+            } else {
+              editor.revealSourceLine(h.line);
+            }
+          },
+        });
+      }
+      return items;
+    },
   });
+
+  /** Pick a workspace file, insert a relative link to it at the caret. */
+  const insertLinkToFile = async () => {
+    const docPath = editor.path;
+    if (!rootPath || !docPath) return;
+    const all = await backend.listAll(rootPath);
+    const items = all
+      .filter((f) => f.path !== docPath)
+      .map((f) => ({
+        title: baseOf(f.rel).replace(MD_RE, ""),
+        subtitle: f.rel.includes("/") ? parentOf(f.rel) : undefined,
+        search: f.rel,
+        icon: fileIcon(f.rel),
+        run: () => {
+          const href = relativize(dirOf(docPath), f.path)
+            .split("/")
+            .map(encodeURIComponent)
+            .join("/");
+          editor.insertLinkTo(href, displayName(f.path));
+        },
+      }));
+    await palette.pick(items, "Link to which file?");
+  };
 
   // ----------------------------------------------------------- find / replace
   const findBar = $("find-bar");
@@ -1423,7 +1603,12 @@ async function init() {
   const replaceInput = $<HTMLInputElement>("replace-input");
   const findCount = $("find-count");
   const replaceRow = $("replace-row");
-  const findOpts = { caseSensitive: false, wholeWord: false };
+  const findOpts = { caseSensitive: false, wholeWord: false, regex: false };
+  const FIND_OPT_KEYS = {
+    case: "caseSensitive",
+    word: "wholeWord",
+    regex: "regex",
+  } as const;
 
   const selectionText = () => {
     const s = window.getSelection()?.toString() ?? "";
@@ -1432,17 +1617,15 @@ async function init() {
 
   const reflectFindOpts = () => {
     for (const btn of findBar.querySelectorAll<HTMLButtonElement>("[data-find-opt]")) {
-      const on =
-        btn.dataset.findOpt === "case" ? findOpts.caseSensitive : findOpts.wholeWord;
-      btn.classList.toggle("on", on);
-      btn.setAttribute("aria-pressed", String(on));
+      const key = FIND_OPT_KEYS[btn.dataset.findOpt as keyof typeof FIND_OPT_KEYS];
+      btn.classList.toggle("on", findOpts[key]);
+      btn.setAttribute("aria-pressed", String(findOpts[key]));
     }
   };
   for (const btn of findBar.querySelectorAll<HTMLButtonElement>("[data-find-opt]")) {
     btn.addEventListener("click", () => {
-      if (btn.dataset.findOpt === "case")
-        findOpts.caseSensitive = !findOpts.caseSensitive;
-      else findOpts.wholeWord = !findOpts.wholeWord;
+      const key = FIND_OPT_KEYS[btn.dataset.findOpt as keyof typeof FIND_OPT_KEYS];
+      findOpts[key] = !findOpts[key];
       reflectFindOpts();
       doFind();
       findInput.focus();
@@ -1748,15 +1931,19 @@ async function init() {
     // then cancelled, and a latch left set there made this window permanently
     // unclosable and blocked every future ⌘Q for the whole app.
     let settling = false;
-    const settle = async (verb: string): Promise<boolean> => {
+    const settle = async (verb: string, warnDraft: boolean): Promise<boolean> => {
       if (settling) return false; // one dialog, one flush, however many asks
       settling = true;
       try {
         // localStorage is synchronous — the session survives a hung flush.
+        // The session carries the draft's text, so quitting no longer loses
+        // it: it reappears on the next launch.
         clearTimeout(sessionTimer);
-        persistSession(localStorage, buildSession(), SESSION);
-        // Warn before losing an unsaved draft (drafts never autosave).
-        if (hasUnsavedDraft()) {
+        const persisted = persistSession(localStorage, buildSession(), SESSION);
+        // Only warn when the draft genuinely won't come back: this window's
+        // session is about to be discarded, or the write just failed (quota,
+        // private mode) — a swallowed failure must not become a silent loss.
+        if ((warnDraft || !persisted) && hasUnsavedDraft()) {
           const proceed = await backend.confirm(
             "Unsaved file",
             `You have an unsaved file that will be lost. ${verb} without saving?`,
@@ -1777,7 +1964,9 @@ async function init() {
       // ALWAYS ack first, even when re-entered: every ExitRequested arms a
       // fresh backstop, and each one must learn this webview is alive.
       void invoke("exit_ack").catch(() => {});
-      if (await settle("Quit")) {
+      // Secondary windows aren't restored on the next launch (a new window
+      // starts fresh), so their drafts still deserve the warning.
+      if (await settle("Quit", !isMainWindow)) {
         void invoke("confirm_exit").catch(() => {});
       } else {
         // Declining cancels the quit for everyone — and clears the tally, so
@@ -1796,7 +1985,7 @@ async function init() {
       // rather than leaving the user clicking a dead button.
       e.preventDefault();
       try {
-        if (!(await settle("Close"))) return;
+        if (!(await settle("Close", !isMainWindow))) return;
         // Extra windows are ephemeral — leaving their session behind would
         // accumulate dead keys in localStorage forever.
         if (!isMainWindow) clearSession(localStorage, SESSION);
@@ -1816,6 +2005,8 @@ async function init() {
       "menu-save": () => void save(),
       "menu-save-as": () => void saveAs(),
       "menu-export-html": () => void exportHtml(),
+      "menu-print": () => window.print(),
+      "menu-toggle-outline": () => toggleOutline(),
       "menu-close-tab": () => activePath && void closeTab(activePath),
       "menu-find": () => openFind(false),
       "menu-find-replace": () => openFind(true),
@@ -1922,6 +2113,13 @@ async function init() {
     } else if (!isTauri) {
       await openFile("/demo/welcome.md");
     }
+  }
+  // A draft that was alive at the last quit — or the last crash — comes back.
+  if (saved.draft && !tabs.some((t) => t.draft)) {
+    draftBuffer = saved.draft;
+    tabs.push({ path: DRAFT, kind: "md", draft: true });
+    renderTabs();
+    if (activePath === null) await activate(DRAFT);
   }
   updateStatus();
 }
