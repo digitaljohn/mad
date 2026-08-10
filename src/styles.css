@@ -126,6 +126,11 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(222, 220, 209, 0.35);
 }
+/* The corner square where two scrollbars would meet defaults to WHITE and
+   flashes during resizes when a second bar transiently exists. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 html,
 body {
@@ -1141,6 +1146,7 @@ body.tauri.sidebar-hidden #topbar {
 
 #editor-host {
   flex: 1;
+  min-width: 0; /* must be shrinkable when the terminal docks to the right */
   overflow-y: auto;
   position: relative;
 }
@@ -1694,6 +1700,119 @@ milkdown-link-edit,
   }
   #editor:has(.editor-print-source) .editor-rich,
   #editor:has(.editor-print-source) .editor-source {
+    display: none !important;
+  }
+}
+
+/* ------------------------------------------------------ terminal panel */
+
+/* Editor and terminal share this split: a column when the terminal docks
+   below (the default), a row when it docks to the right. */
+#main-split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+#main-split.dock-right {
+  flex-direction: row;
+}
+
+#terminal-panel {
+  position: relative;
+  flex-shrink: 0;
+  height: 240px;
+  min-height: 96px;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: #1b1b1a;
+}
+#main-split.dock-right #terminal-panel {
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  width: 420px;
+  min-width: 260px;
+  max-width: 60vw;
+  border-top: none;
+  border-left: 1px solid var(--border);
+}
+:root.light #terminal-panel {
+  background: #f7f5ee;
+}
+/* The grab edge sits on whichever side faces the editor. */
+#terminal-resizer {
+  position: absolute;
+  z-index: 2;
+  top: -2px;
+  left: 0;
+  right: 0;
+  height: 5px;
+  cursor: row-resize;
+}
+#main-split.dock-right #terminal-resizer {
+  top: 0;
+  bottom: 0;
+  right: auto;
+  left: -2px;
+  height: auto;
+  width: 5px;
+  cursor: col-resize;
+}
+#terminal-resizer:hover,
+#terminal-resizer.dragging {
+  background: var(--clay);
+  opacity: 0.5;
+}
+#terminal-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+#terminal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 2px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+#terminal-host {
+  flex: 1;
+  min-height: 0;
+  padding: 2px 6px 6px 14px;
+}
+#terminal-host .xterm {
+  height: 100%;
+}
+/* The fitted grid grows in whole character cells, so a resize can leave a
+   remainder strip past the last row/column. xterm's stock stylesheet paints
+   the viewport black there — let the panel's own background show instead.
+   And never let a mid-drag width transient spawn a horizontal bar: the
+   fleeting second scrollbar is what makes the corner square flash. */
+#terminal-host .xterm-viewport {
+  background-color: transparent !important;
+  overflow-x: hidden;
+  /* xterm v6 draws its own themed scrollbar; the viewport's overflow only
+     exists to catch wheel input. WKWebView still gives it a native overlay
+     knob — unstylable, white on our dark panel, flashing in the corner on
+     every resize. Hide the native bar; the custom one is the indicator. */
+  scrollbar-width: none;
+}
+#terminal-host .xterm-viewport::-webkit-scrollbar {
+  display: none;
+}
+#btn-terminal.active {
+  background: var(--active);
+  color: var(--clay);
+}
+@media print {
+  #terminal-panel {
     display: none !important;
   }
 }

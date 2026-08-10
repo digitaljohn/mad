@@ -254,6 +254,13 @@ export function mockBackend(): Backend {
     gitDiscardKind: async (path) =>
       path.endsWith("README.md") ? "restore" : "trash",
     watchFolder: async () => {},
+    // A real shell needs a real process — the browser build has neither.
+    termOpen: async () => {
+      throw new Error("The terminal needs the desktop app.");
+    },
+    termWrite: async () => {},
+    termResize: async () => {},
+    termClose: async () => {},
   };
 
   /** Move a file or a whole directory subtree from oldP to newP (mock only). */

@@ -35,7 +35,8 @@ export type KeyAction =
   | { kind: "new-file" }
   | { kind: "new-window" }
   | { kind: "toggle-source" }
-  | { kind: "toggle-split" };
+  | { kind: "toggle-split" }
+  | { kind: "toggle-terminal" };
 
 /**
  * Resolve a modifier keystroke to an action, or null when nothing should run.
@@ -86,5 +87,10 @@ export function resolveKey(k: KeyStroke, ctx: KeyContext): KeyAction | null {
   if (k.code === "KeyN") return { kind: "new-file" };
   if (k.code === "KeyM" && k.shift) return { kind: "toggle-source" };
   if (k.code === "KeyV" && k.shift) return { kind: "toggle-split" };
+  // ⌃` (not ⌘`): macOS spends ⌘` on cycling an app's windows, and this app
+  // has real multi-window users. Ctrl matches VS Code and iTerm anyway.
+  if (k.code === "Backquote" && k.ctrl && !k.meta && !k.shift && !k.alt) {
+    return { kind: "toggle-terminal" };
+  }
   return null;
 }

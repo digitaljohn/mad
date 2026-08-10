@@ -73,6 +73,9 @@
             <button id="btn-split" class="icon-btn hidden" title="Split preview (⌘⇧V)" aria-label="Toggle split preview" aria-pressed="false">
               <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M8 2.5v11"/></svg>
             </button>
+            <button id="btn-terminal" class="icon-btn" title="Toggle terminal (⌃`)" aria-label="Toggle terminal" aria-pressed="false">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4.5 6l2.5 2-2.5 2"/><path d="M8.5 10.5h3"/></svg>
+            </button>
           </div>
         </header>
         <div id="find-bar" class="hidden" role="search">
@@ -96,6 +99,7 @@
             </div>
           </div>
         </div>
+        <div id="main-split">
         <div id="editor-host">
           <div id="welcome">
             <div class="welcome-mark">✳</div>
@@ -128,6 +132,22 @@
             <img id="image-viewer-img" alt="" />
             <div id="image-meta"></div>
           </div>
+        </div>
+        <div id="terminal-panel" class="hidden">
+          <div id="terminal-resizer" role="separator" aria-orientation="horizontal" aria-label="Resize terminal" tabindex="0"></div>
+          <div id="terminal-head">
+            <span>Terminal</span>
+            <div id="terminal-head-actions">
+              <button id="terminal-dock" class="icon-btn" title="Dock to the right" aria-label="Move terminal to the right">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M10 2.5v11"/></svg>
+              </button>
+              <button id="terminal-close" class="icon-btn" title="Kill terminal" aria-label="Close terminal">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="terminal-host"></div>
+        </div>
         </div>
         <footer id="statusbar">
           <span id="status-path"></span>
