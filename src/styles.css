@@ -126,6 +126,11 @@
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(222, 220, 209, 0.35);
 }
+/* The corner square where two scrollbars would meet defaults to WHITE and
+   flashes during resizes when a second bar transiently exists. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 html,
 body {
@@ -1787,9 +1792,12 @@ milkdown-link-edit,
 }
 /* The fitted grid grows in whole character cells, so a resize can leave a
    remainder strip past the last row/column. xterm's stock stylesheet paints
-   the viewport black there — let the panel's own background show instead. */
+   the viewport black there — let the panel's own background show instead.
+   And never let a mid-drag width transient spawn a horizontal bar: the
+   fleeting second scrollbar is what makes the corner square flash. */
 #terminal-host .xterm-viewport {
   background-color: transparent !important;
+  overflow-x: hidden;
 }
 #btn-terminal.active {
   background: var(--active);
