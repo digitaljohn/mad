@@ -3,7 +3,7 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-08-10
 
 ### Added
 
