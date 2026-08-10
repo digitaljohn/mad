@@ -99,6 +99,9 @@ async function init() {
   let docScale = clampScale(saved.scale);
   /** Recently active files, most recent first — Quick Open shows these on top. */
   let recentFiles = saved.recent;
+  /** The terminal panel's live instance — null until first opened.
+      Declared here because applyTheme touches it during startup. */
+  let terminal: import("./terminal").TerminalPanel | null = null;
   /** Last known scroll/caret per file, in-session and across launches. */
   const viewPositions = new Map<string, ViewPosition>(Object.entries(saved.positions));
   /** Re-insert so capPositions trims least-recently-used entries, not the
@@ -131,6 +134,10 @@ async function init() {
       positions: capPositions(Object.fromEntries(viewPositions)),
       draft: hasUnsavedDraft() ? draftContent() : null,
       outlineHidden,
+      terminalOpen: !terminalPanel.classList.contains("hidden"),
+      terminalDock,
+      terminalHeight,
+      terminalWidth,
     };
   };
   const saveSession = () => {
@@ -1152,6 +1159,7 @@ async function init() {
   const applyTheme = (light: boolean) => {
     document.documentElement.classList.toggle("light", light);
     editor.setMermaidTheme(light);
+    terminal?.setTheme(light);
   };
   // Until the user picks a side, the app follows the system — a light-mode
   // Mac shouldn't get a dark editor on first launch. The first explicit
@@ -1416,6 +1424,196 @@ async function init() {
   };
   $("outline-close").addEventListener("click", toggleOutline);
 
+  // ------------------------------------------------------ terminal panel
+  // A real shell under the editor, for the folks who want `claude` (or git,
+  // or make) next to their specs. Strictly on demand: no PTY exists until
+  // the panel opens, and closing the panel kills it. Whatever the shell
+  // changes on disk flows back through the same watcher that already
+  // handles every other external edit.
+  const terminalPanel = $("terminal-panel");
+  const terminalHost = $("terminal-host");
+  const btnTerminal = $("btn-terminal");
+  const mainSplit = $("main-split");
+  type TerminalModule = typeof import("./terminal");
+  let terminalOpening = false;
+  let termGitTimer: ReturnType<typeof setTimeout> | undefined;
+  let terminalDock: "bottom" | "right" = saved.terminalDock;
+  let terminalHeight = saved.terminalHeight;
+  let terminalWidth = saved.terminalWidth;
+
+  /** Lay the panel out for its dock side, restoring that side's size. */
+  const applyDock = () => {
+    mainSplit.classList.toggle("dock-right", terminalDock === "right");
+    terminalPanel.style.height =
+      terminalDock === "bottom" ? (terminalHeight ?? "") : "";
+    terminalPanel.style.width =
+      terminalDock === "right" ? (terminalWidth ?? "") : "";
+    const dockBtn = $("terminal-dock");
+    const toRight = terminalDock === "bottom";
+    dockBtn.title = toRight ? "Dock to the right" : "Dock below";
+    dockBtn.setAttribute(
+      "aria-label",
+      toRight ? "Move terminal to the right" : "Move terminal below",
+    );
+    // xterm must re-measure once the new geometry has painted.
+    requestAnimationFrame(() => terminal?.resize());
+  };
+  applyDock();
+
+  const reflectTerminal = () => {
+    const open = !terminalPanel.classList.contains("hidden");
+    btnTerminal.classList.toggle("active", open);
+    btnTerminal.setAttribute("aria-pressed", String(open));
+  };
+
+  /** Output means the shell may have touched files or git state. The
+      watcher catches file edits on its own, but a `.git` directory above
+      the workspace root is outside its view — this covers commits made in
+      the panel for that layout too. */
+  const onTerminalActivity = () => {
+    clearTimeout(termGitTimer);
+    termGitTimer = setTimeout(() => refreshGit(), 1000);
+  };
+
+  /** Show the panel, spawning a shell only if none is alive. Hiding the
+      panel never kills the shell — a `claude` run keeps working out of
+      sight — so this often just unhides a running terminal. */
+  const openTerminal = async (focus = true) => {
+    terminalPanel.classList.remove("hidden");
+    reflectTerminal();
+    if (terminal?.running || terminalOpening) {
+      terminal?.resize();
+      if (focus) terminal?.focus();
+      saveSession();
+      return;
+    }
+    terminalOpening = true;
+    try {
+      // Loaded on first use: xterm is a quarter megabyte the majority of
+      // sessions never need.
+      const mod: TerminalModule = await import("./terminal");
+      if (terminal) void terminal.dispose(); // an exited shell's leftovers
+      terminalHost.innerHTML = "";
+      const panel = new mod.TerminalPanel(terminalHost, backend, {
+        onActivity: onTerminalActivity,
+      });
+      terminal = panel;
+      await panel.start(rootPath, focus);
+      // Killed (✕) while the shell was still spawning — take it down.
+      if (terminal !== panel) {
+        void panel.dispose();
+        return;
+      }
+      saveSession();
+    } catch (e) {
+      terminalPanel.classList.add("hidden");
+      reflectTerminal();
+      const t = terminal;
+      terminal = null;
+      if (t) void t.dispose();
+      toastError("Couldn’t open a terminal", e);
+    } finally {
+      terminalOpening = false;
+    }
+  };
+
+  /** Tuck the panel away; the shell keeps running. */
+  const hideTerminal = () => {
+    terminalPanel.classList.add("hidden");
+    reflectTerminal();
+    saveSession();
+    editor.focus();
+  };
+
+  /** The panel's ✕: end the shell and put the panel away. */
+  const killTerminal = () => {
+    terminalPanel.classList.add("hidden");
+    reflectTerminal();
+    const t = terminal;
+    terminal = null;
+    if (t) void t.dispose();
+    saveSession();
+    editor.focus();
+  };
+
+  const toggleTerminal = () => {
+    if (terminalPanel.classList.contains("hidden")) void openTerminal();
+    else hideTerminal();
+  };
+  btnTerminal.addEventListener("click", toggleTerminal);
+  $("terminal-close").addEventListener("click", killTerminal);
+
+  // Switch which side the panel lives on; each side remembers its size.
+  const toggleDock = () => {
+    terminalDock = terminalDock === "bottom" ? "right" : "bottom";
+    applyDock();
+    saveSession();
+    terminal?.focus();
+  };
+  $("terminal-dock").addEventListener("click", toggleDock);
+
+  // Drag the panel's editor-facing edge to taste; sizes persist like the
+  // sidebar's width does.
+  const termResizer = $("terminal-resizer");
+  const startTermResize = (start: MouseEvent, rect: DOMRect) => {
+    termResizer.classList.add("dragging");
+    const vertical = terminalDock === "bottom";
+    document.body.style.cursor = vertical ? "row-resize" : "col-resize";
+    const onMove = (ev: MouseEvent) => {
+      if (vertical) {
+        const h = Math.min(
+          window.innerHeight * 0.6,
+          Math.max(96, rect.height + (start.clientY - ev.clientY)),
+        );
+        terminalHeight = `${h}px`;
+        terminalPanel.style.height = terminalHeight;
+      } else {
+        const w = Math.min(
+          window.innerWidth * 0.6,
+          Math.max(260, rect.width + (start.clientX - ev.clientX)),
+        );
+        terminalWidth = `${w}px`;
+        terminalPanel.style.width = terminalWidth;
+      }
+      terminal?.resize();
+    };
+    const onUp = () => {
+      termResizer.classList.remove("dragging");
+      document.body.style.cursor = "";
+      saveSession();
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  termResizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    startTermResize(e, terminalPanel.getBoundingClientRect());
+  });
+  termResizer.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? 32 : 8;
+    const vertical = terminalDock === "bottom";
+    const grow = vertical ? "ArrowUp" : "ArrowLeft";
+    const shrink = vertical ? "ArrowDown" : "ArrowRight";
+    if (e.key !== grow && e.key !== shrink) return;
+    e.preventDefault();
+    const rect = terminalPanel.getBoundingClientRect();
+    const delta = e.key === grow ? step : -step;
+    if (vertical) {
+      const h = Math.min(window.innerHeight * 0.6, Math.max(96, rect.height + delta));
+      terminalHeight = `${h}px`;
+      terminalPanel.style.height = terminalHeight;
+    } else {
+      const w = Math.min(window.innerWidth * 0.6, Math.max(260, rect.width + delta));
+      terminalWidth = `${w}px`;
+      terminalPanel.style.width = terminalWidth;
+    }
+    terminal?.resize();
+    saveSession();
+  });
+  window.addEventListener("resize", () => terminal?.resize());
+
   // -------------------------------------------------------- command palette
   interface Command {
     title: string;
@@ -1474,6 +1672,7 @@ async function init() {
       when: () => isMd() && !editor.isDraft && !!rootPath,
     },
     { title: "Toggle Outline", run: () => toggleOutline(), when: isMd },
+    { title: "Toggle Terminal", hint: "⌃`", run: () => toggleTerminal() },
     {
       title: "Toggle Markdown Source",
       hint: "⌘⇧M",
@@ -1890,6 +2089,9 @@ async function init() {
       case "toggle-split":
         toggleSplit();
         break;
+      case "toggle-terminal":
+        toggleTerminal();
+        break;
     }
   });
   window.addEventListener("blur", () => void editor.flush());
@@ -2007,6 +2209,7 @@ async function init() {
       "menu-export-html": () => void exportHtml(),
       "menu-print": () => window.print(),
       "menu-toggle-outline": () => toggleOutline(),
+      "menu-toggle-terminal": () => toggleTerminal(),
       "menu-close-tab": () => activePath && void closeTab(activePath),
       "menu-find": () => openFind(false),
       "menu-find-replace": () => openFind(true),
@@ -2033,6 +2236,14 @@ async function init() {
     );
 
     void listen("root-gone", () => void onRootGone(), mine);
+
+    // The terminal's PTY output and end-of-shell, for this window only.
+    void listen<{ id: number; data: string }>(
+      "term-output",
+      (e) => terminal?.receive(e.payload.id, e.payload.data),
+      mine,
+    );
+    void listen<number>("term-exit", (e) => terminal?.exited(e.payload), mine);
 
     // The workspace changed underneath us (another app, a sync client, git…).
     // Scoped like the rest: this is *our* watcher reporting on *our* folder,
@@ -2121,6 +2332,9 @@ async function init() {
     renderTabs();
     if (activePath === null) await activate(DRAFT);
   }
+  // So does an open terminal — with a fresh shell in the restored folder.
+  // No focus: at launch the document is what you came back for.
+  if (saved.terminalOpen && isTauri) void openTerminal(false);
   updateStatus();
 }
 

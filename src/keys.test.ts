@@ -42,6 +42,7 @@ describe("resolveKey", () => {
       "KeyD",
       "KeyO",
       "Backslash",
+      "Backquote",
       "Minus",
       "Digit0",
       "KeyS",
@@ -92,6 +93,8 @@ describe("resolveKey", () => {
       ["KeyW", {}, { kind: "close-tab" }],
       ["KeyD", { shift: true }, { kind: "show-diff" }],
       ["Backslash", {}, { kind: "toggle-sidebar" }],
+      // ⌃` — control, not command, which macOS spends on window cycling.
+      ["Backquote", { meta: false, ctrl: true }, { kind: "toggle-terminal" }],
       ["Equal", {}, { kind: "zoom", delta: 1 }],
       ["Minus", {}, { kind: "zoom", delta: -1 }],
       ["Digit0", {}, { kind: "zoom", delta: 0 }],
@@ -122,11 +125,18 @@ describe("resolveKey", () => {
     });
 
     it("keeps modifier variants distinct", () => {
-      // ⌘⇧K, ⌘⌥K, ⌘⇧W, ⌘⇧\ are unbound on purpose.
+      // ⌘⇧K, ⌘⌥K, ⌘⇧W, ⌘⇧\, ⌘⇧` are unbound on purpose.
       expect(resolveKey(stroke("KeyK", { shift: true }), browser)).toBeNull();
       expect(resolveKey(stroke("KeyK", { alt: true }), browser)).toBeNull();
       expect(resolveKey(stroke("KeyW", { shift: true }), browser)).toBeNull();
       expect(resolveKey(stroke("Backslash", { shift: true }), browser)).toBeNull();
+      expect(resolveKey(stroke("Backquote", { shift: true }), browser)).toBeNull();
+      expect(resolveKey(stroke("Backquote", { alt: true }), browser)).toBeNull();
+      // ⌘` stays free for macOS window cycling.
+      expect(resolveKey(stroke("Backquote"), browser)).toBeNull();
+      expect(
+        resolveKey(stroke("Backquote", { meta: false, ctrl: true, shift: true }), browser),
+      ).toBeNull();
     });
 
     it("returns null for unbound keys", () => {

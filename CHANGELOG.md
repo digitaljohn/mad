@@ -3,7 +3,25 @@
 Notable changes per release. mad follows [semver](https://semver.org) as far as
 a 0.x app can: expect minor-version bumps for features, patch bumps for fixes.
 
-## 0.3.0 — 2026-08-10
+## 0.4.0 — unreleased
+
+### Added
+
+- **A terminal.** ⌃\` (or the top-bar button, the View menu, the palette)
+  opens a real shell under the editor, starting in the open folder — for
+  `claude`, `git`, `make`, or whatever else maintains your specs alongside
+  you. Strictly on demand: no shell process exists until you first open the
+  panel. Toggling the panel merely hides it — a running `claude` keeps
+  working out of sight — and the panel's ✕ ends the shell for real (as does
+  closing the window). Whatever runs in there edits files, mad
+  reacts the way it always has to outside edits — the tree refreshes, git
+  badges update, open documents reload (or warn, if you have unsaved
+  changes). Terminal output also nudges the git decorations directly, which
+  covers repositories whose `.git` lives above the open folder — the one
+  place the filesystem watcher can't see. Docks below the editor or to its
+  right (the button in the panel header swaps sides, each side remembers
+  its size); dock, size and open state ride the session. A login shell, so
+  your PATH is the one your terminal has.
 
 The round-trip promise, actually kept — plus the features a folder-of-specs
 editor was missing.

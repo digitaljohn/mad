@@ -240,6 +240,18 @@ describe("listAll", () => {
   });
 });
 
+describe("terminal (browser mock)", () => {
+  it("refuses to open — a shell needs the desktop app", async () => {
+    await expect(be.termOpen(null, 80, 24)).rejects.toThrow(/desktop app/);
+  });
+
+  it("write/resize/close are inert no-ops, not crashes", async () => {
+    await expect(be.termWrite(1, "ls\n")).resolves.toBeUndefined();
+    await expect(be.termResize(1, 80, 24)).resolves.toBeUndefined();
+    await expect(be.termClose(1)).resolves.toBeUndefined();
+  });
+});
+
 describe("searchFiles", () => {
   const opts = { regex: false, caseSensitive: false, wholeWord: false };
 

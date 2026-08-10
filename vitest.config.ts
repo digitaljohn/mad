@@ -32,6 +32,10 @@ export default defineConfig({
         // Tauri IPC surface — invoke() only exists inside the app. The
         // browser mock lives in backend.mock.ts, which IS measured.
         "src/backend.ts",
+        // terminal.ts wraps xterm.js, which needs real layout and canvas
+        // measurement jsdom does not provide; its backend half is covered
+        // by the Rust PTY tests instead.
+        "src/terminal.ts",
       ],
       // A floor, not a target. Vitest 4's v8 provider maps coverage through
       // the AST rather than by line, so it counts defensive branches the old

@@ -568,6 +568,9 @@ fn rebuild_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
             Some("CmdOrCtrl+\\"),
         )?)
         .item(&gitem("toggle_outline", "Toggle Outline", None, Gate::Doc)?)
+        // ⌃`, not ⌘`: macOS spends ⌘` on cycling an app's windows, and mad
+        // has real multi-window users. Ctrl matches VS Code and iTerm.
+        .item(&item("toggle_terminal", "Toggle Terminal", Some("Ctrl+`"))?)
         .separator()
         .item(&gitem(
             "show_changes",
@@ -1447,6 +1450,300 @@ struct SearchResult {
     truncated: bool,
 }
 
+// --------------------------------------------------------------- terminal
+
+/// One live PTY per open terminal panel. A shell exists only while its
+/// panel does: spawned when the user opens the terminal, killed when the
+/// panel — or the window holding it — closes.
+#[derive(Default)]
+struct Terminals(Mutex<HashMap<u64, Term>>);
+
+struct Term {
+    /// Which window's panel owns this PTY. Output is delivered to that
+    /// window and nowhere else, and a dying window takes its shells along.
+    label: String,
+    /// Its own lock, NOT the map's: a write to a full PTY input queue
+    /// blocks (macOS caps it around 1KB), and blocking while holding the
+    /// map mutex would wedge every other terminal command — including the
+    /// close that could unblock things — and the window-destroy cleanup
+    /// with them.
+    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    /// Kill and reap both happen under this one lock, and kill only after
+    /// try_wait says the child is unreaped — so a recycled PID can never
+    /// be signalled, no matter how close/exit/destroy interleave.
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+/// Kill a shell, safely: under its child lock, and only while unreaped.
+fn kill_term(term: &Term) {
+    let mut child = term.child.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(None) = child.try_wait() {
+        let _ = child.kill();
+    }
+}
+
+static NEXT_TERM: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Serialize)]
+struct TermOutput {
+    id: u64,
+    /// Raw PTY bytes as base64 — a read can split a UTF-8 sequence, so the
+    /// bytes cross the bridge intact and the emulator does the decoding.
+    data: String,
+}
+
+/// The user's login shell, as macOS records it for every session.
+fn login_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".into())
+}
+
+struct TermParts {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    reader: Box<dyn std::io::Read + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+/// Spawn `program` under a fresh PTY. Kept apart from the command so the
+/// tests can drive a plain `/bin/sh` through the same plumbing.
+fn open_term(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    rows: u16,
+    cols: u16,
+) -> Result<TermParts, String> {
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())?;
+    let mut cmd = portable_pty::CommandBuilder::new(program);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    if let Some(dir) = cwd {
+        if dir.is_dir() {
+            cmd.cwd(dir);
+        }
+    }
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    // The slave stays with the child; holding our copy open would stop the
+    // reader from ever seeing EOF after the shell exits.
+    drop(pair.slave);
+    let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    Ok(TermParts {
+        master: pair.master,
+        writer,
+        reader,
+        child,
+    })
+}
+
+/// Open a shell for this window's terminal panel, in `cwd` (the open
+/// folder). An interactive *login* shell, so the user's real PATH — and
+/// with it `claude`, nvm, brew and friends — is present.
+#[tauri::command]
+async fn term_open(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<u64, String> {
+    let shell = login_shell();
+    // csh/tcsh reject -l combined with any other flag, and a PTY-attached
+    // shell is interactive regardless — -l alone still means login.
+    let base = Path::new(&shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let args: &[&str] = if base == "csh" || base == "tcsh" {
+        &["-l"]
+    } else {
+        &["-i", "-l"]
+    };
+    let parts = open_term(
+        &shell,
+        args,
+        cwd.as_deref().map(Path::new),
+        rows.max(2),
+        cols.max(2),
+    )?;
+    let id = NEXT_TERM.fetch_add(1, Ordering::Relaxed);
+    let label = window.label().to_string();
+    let child = Arc::new(Mutex::new(parts.child));
+    app.state::<Terminals>()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            id,
+            Term {
+                label: label.clone(),
+                writer: Arc::new(Mutex::new(parts.writer)),
+                master: parts.master,
+                child: Arc::clone(&child),
+            },
+        );
+
+    // Reader: streams PTY bytes to the panel. Pure plumbing — it has no
+    // lifecycle duties, because EOF here needs every slave fd to close,
+    // and a backgrounded child can hold one long after the shell died.
+    let mut reader = parts.reader;
+    let reader_app = app.clone();
+    let reader_label = label.clone();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                    if reader_app
+                        .emit_to(
+                            reader_label.as_str(),
+                            "term-output",
+                            TermOutput { id, data },
+                        )
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Waiter: reaps the shell the moment it exits — under the same lock
+    // every kill path uses, so nothing can signal a reaped PID. Polling
+    // beats a blocking wait() here precisely because it shares that lock.
+    let waiter_app = app.clone();
+    std::thread::spawn(move || {
+        loop {
+            {
+                let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+                match c.try_wait() {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => break,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // Dropping the entry closes writer and master; the reader thread
+        // ends when the last slave fd goes with them (or lives on while a
+        // surviving background child keeps talking — also correct).
+        if let Some(state) = waiter_app.try_state::<Terminals>() {
+            state
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+        let _ = waiter_app.emit_to(label.as_str(), "term-exit", id);
+    });
+
+    // The window can vanish between spawn and insert; its Destroyed
+    // cleanup may have already run and found nothing. Re-check, or the
+    // shell outlives its window until app exit.
+    if app.get_webview_window(window.label()).is_none() {
+        let removed = app
+            .state::<Terminals>()
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        if let Some(term) = removed {
+            kill_term(&term);
+        }
+        return Err("the window is closing".into());
+    }
+    Ok(id)
+}
+
+/// Keystrokes (and pastes) from the panel into the shell's stdin.
+#[tauri::command]
+async fn term_write(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    id: u64,
+    data: String,
+) -> Result<(), String> {
+    // Hold the map lock only long enough to find the writer: the write
+    // itself can block on a full tty input queue (macOS caps it ~1KB),
+    // and blocking there must wedge this one terminal, not the map.
+    let writer = {
+        let state = app.state::<Terminals>();
+        let map = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        let term = map.get(&id).ok_or("terminal is gone")?;
+        if term.label != window.label() {
+            return Err("terminal belongs to another window".into());
+        }
+        Arc::clone(&term.writer)
+    };
+    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+    writer
+        .write_all(data.as_bytes())
+        .map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())
+}
+
+/// The panel changed size — tell the PTY so the shell reflows.
+#[tauri::command]
+async fn term_resize(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    id: u64,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let state = app.state::<Terminals>();
+    let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let term = map.get_mut(&id).ok_or("terminal is gone")?;
+    if term.label != window.label() {
+        return Err("terminal belongs to another window".into());
+    }
+    term.master
+        .resize(portable_pty::PtySize {
+            rows: rows.max(2),
+            cols: cols.max(2),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// The panel closed: kill the shell and forget it. Dropping the writer and
+/// master ends the reader thread via EOF.
+#[tauri::command]
+async fn term_close(app: tauri::AppHandle, window: tauri::Window, id: u64) -> Result<(), String> {
+    let removed = {
+        let state = app.state::<Terminals>();
+        let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(term) = map.get(&id) {
+            if term.label != window.label() {
+                return Err("terminal belongs to another window".into());
+            }
+        }
+        map.remove(&id)
+    };
+    if let Some(term) = removed {
+        kill_term(&term);
+    }
+    Ok(())
+}
+
 /// A line's code-fence opener: up to three spaces of indent, then a run of
 /// at least three backticks or tildes. Returns the fence character and run
 /// length so a closer can be required to match (CommonMark's rule).
@@ -2270,6 +2567,7 @@ pub fn run() {
             app.manage(MenuState::default());
             app.manage(FsWatcher::default());
             app.manage(ExitFlow(Arc::new(ExitFlowState::default())));
+            app.manage(Terminals::default());
             // The window that exists at startup owns the menu bar until focus
             // says otherwise.
             if let Some(w) = app.webview_windows().keys().next() {
@@ -2329,7 +2627,7 @@ pub fn run() {
                 }
             };
             // Menu items that are just a named signal to the frontend.
-            const FORWARD: [(&str, &str); 22] = [
+            const FORWARD: [(&str, &str); 23] = [
                 ("open_folder", "menu-open-folder"),
                 ("new_file", "menu-new-file"),
                 ("new_folder", "menu-new-folder"),
@@ -2338,6 +2636,7 @@ pub fn run() {
                 ("export_html", "menu-export-html"),
                 ("print", "menu-print"),
                 ("toggle_outline", "menu-toggle-outline"),
+                ("toggle_terminal", "menu-toggle-terminal"),
                 ("close_tab", "menu-close-tab"),
                 ("find", "menu-find"),
                 ("find_replace", "menu-find-replace"),
@@ -2439,6 +2738,10 @@ pub fn run() {
             git_discard_kind,
             watch_folder,
             new_window,
+            term_open,
+            term_write,
+            term_resize,
+            term_close,
             confirm_exit,
             exit_ack,
             exit_declined
@@ -2462,6 +2765,25 @@ pub fn run() {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&label);
+                    // Terminals die with their window — a shell nobody can
+                    // see or reach is a leak, not a feature. Take them out
+                    // of the map first, kill after: this runs on the main
+                    // thread, and nothing here may block on a child lock
+                    // while also holding the map.
+                    if let Some(terms) = app.try_state::<Terminals>() {
+                        let dead: Vec<Term> = {
+                            let mut map = terms.0.lock().unwrap_or_else(|e| e.into_inner());
+                            let ids: Vec<u64> = map
+                                .iter()
+                                .filter(|(_, t)| t.label == label)
+                                .map(|(k, _)| *k)
+                                .collect();
+                            ids.into_iter().filter_map(|i| map.remove(&i)).collect()
+                        };
+                        for term in &dead {
+                            kill_term(term);
+                        }
+                    }
                     let ms = app.state::<MenuState>();
                     ms.per_window
                         .lock()
@@ -2805,6 +3127,70 @@ mod tests {
     fn a_bad_regex_is_an_error_not_a_panic() {
         let t = TempDir::new();
         assert!(run(search_files(t.s(""), "([".into(), true, false, false, None)).is_err());
+    }
+
+    // ------------------------------------------------------------ terminal
+
+    fn read_pty_until(parts: &mut TermParts, needle: &str) -> String {
+        use std::io::Read as _;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match parts.reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&buf[..n]);
+                    if String::from_utf8_lossy(&out).contains(needle) {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn login_shell_is_an_absolute_path() {
+        assert!(login_shell().starts_with('/'));
+    }
+
+    #[test]
+    fn pty_round_trips_output() {
+        let mut parts =
+            open_term("/bin/sh", &["-c", "printf mad-pty-ok"], None, 24, 80).expect("openpty");
+        let out = read_pty_until(&mut parts, "mad-pty-ok");
+        assert!(out.contains("mad-pty-ok"), "got: {out:?}");
+        let _ = parts.child.wait();
+    }
+
+    #[test]
+    fn pty_starts_in_the_requested_folder() {
+        let t = TempDir::new();
+        let mut parts =
+            open_term("/bin/sh", &["-c", "pwd"], Some(t.path()), 24, 80).expect("openpty");
+        // Compare by the unique final segment: macOS reports the physical
+        // /private/var path while the TempDir helper may hold the symlink.
+        let name = t.path().file_name().unwrap().to_string_lossy().into_owned();
+        let out = read_pty_until(&mut parts, &name);
+        assert!(out.contains(&name), "pwd printed: {out:?}");
+        let _ = parts.child.wait();
+    }
+
+    #[test]
+    fn pty_ignores_a_cwd_that_no_longer_exists() {
+        // A stale workspace path must not stop the shell from opening.
+        let mut parts = open_term(
+            "/bin/sh",
+            &["-c", "printf still-alive"],
+            Some(Path::new("/definitely/not/a/real/dir")),
+            24,
+            80,
+        )
+        .expect("openpty");
+        let out = read_pty_until(&mut parts, "still-alive");
+        assert!(out.contains("still-alive"), "got: {out:?}");
+        let _ = parts.child.wait();
     }
 
     #[test]

@@ -58,6 +58,10 @@ describe("parseSession", () => {
       positions: { "/w/a.md": { scroll: 120, sel: 44 } },
       draft: "# not yet saved",
       outlineHidden: false,
+      terminalOpen: true,
+      terminalDock: "right",
+      terminalHeight: "280px",
+      terminalWidth: "400px",
     };
     expect(parseSession(input)).toEqual(input);
   });
@@ -75,7 +79,31 @@ describe("parseSession", () => {
       positions: {},
       draft: null,
       outlineHidden: true,
+      terminalOpen: false,
+      terminalDock: "bottom",
+      terminalHeight: null,
+      terminalWidth: null,
     });
+  });
+
+  it("only accepts the two dock sides", () => {
+    expect(parseSession({ terminalDock: "right" }).terminalDock).toBe("right");
+    for (const bad of ["left", "top", 1, null]) {
+      expect(parseSession({ terminalDock: bad }).terminalDock).toBe("bottom");
+    }
+  });
+
+  it("treats terminalOpen as strictly boolean and height as pixels only", () => {
+    expect(parseSession({ terminalOpen: true }).terminalOpen).toBe(true);
+    for (const bad of ["yes", 1, null]) {
+      expect(parseSession({ terminalOpen: bad }).terminalOpen).toBe(false);
+    }
+    expect(parseSession({ terminalHeight: "240px" }).terminalHeight).toBe("240px");
+    expect(parseSession({ terminalWidth: "420px" }).terminalWidth).toBe("420px");
+    for (const bad of ["60vh", "calc(1px)", 240, "240"]) {
+      expect(parseSession({ terminalHeight: bad }).terminalHeight).toBe(null);
+      expect(parseSession({ terminalWidth: bad }).terminalWidth).toBe(null);
+    }
   });
 
   it("validates positions field by field — a bad entry drops, not the map", () => {

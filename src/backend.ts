@@ -135,6 +135,15 @@ export interface Backend {
   gitDiscardKind(path: string): Promise<string>;
   /** Start watching `root` for external changes (emits `fs-change`). */
   watchFolder(root: string): Promise<void>;
+  /** Spawn a login shell in a PTY for this window's terminal panel.
+      Output arrives via `term-output` events; returns the terminal id. */
+  termOpen(cwd: string | null, cols: number, rows: number): Promise<number>;
+  /** Keystrokes/pastes into the shell's stdin. */
+  termWrite(id: number, data: string): Promise<void>;
+  /** The panel changed size — reflow the PTY. */
+  termResize(id: number, cols: number, rows: number): Promise<void>;
+  /** Kill the shell and forget it. */
+  termClose(id: number): Promise<void>;
 }
 
 export const isTauri = "__TAURI_INTERNALS__" in window;
@@ -206,6 +215,10 @@ async function tauriBackend(): Promise<Backend> {
     gitDiscard: (path) => invoke<string>("git_discard", { path }),
     gitDiscardKind: (path) => invoke<string>("git_discard_kind", { path }),
     watchFolder: (root) => invoke<void>("watch_folder", { path: root }),
+    termOpen: (cwd, cols, rows) => invoke<number>("term_open", { cwd, cols, rows }),
+    termWrite: (id, data) => invoke<void>("term_write", { id, data }),
+    termResize: (id, cols, rows) => invoke<void>("term_resize", { id, cols, rows }),
+    termClose: (id) => invoke<void>("term_close", { id }),
   };
 }
 

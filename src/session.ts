@@ -19,6 +19,13 @@ export interface Session {
   /** The unsaved draft's text, so a quit or crash can't destroy it. */
   draft: string | null;
   outlineHidden: boolean;
+  /** The terminal panel comes back after a relaunch if it was open. */
+  terminalOpen: boolean;
+  /** Where the panel docks: under the editor, or beside it. */
+  terminalDock: "bottom" | "right";
+  /** Panel size per orientation, so switching docks keeps both. */
+  terminalHeight: string | null;
+  terminalWidth: string | null;
 }
 
 export interface ViewPosition {
@@ -116,6 +123,16 @@ export function parseSession(raw: unknown): Session {
     positions: positions(o.positions),
     draft: typeof o.draft === "string" && o.draft.length > 0 ? o.draft : null,
     outlineHidden: o.outlineHidden !== false,
+    terminalOpen: o.terminalOpen === true,
+    terminalDock: o.terminalDock === "right" ? "right" : "bottom",
+    terminalHeight:
+      typeof o.terminalHeight === "string" && /^\d+(\.\d+)?px$/.test(o.terminalHeight)
+        ? o.terminalHeight
+        : null,
+    terminalWidth:
+      typeof o.terminalWidth === "string" && /^\d+(\.\d+)?px$/.test(o.terminalWidth)
+        ? o.terminalWidth
+        : null,
   };
 }
 
